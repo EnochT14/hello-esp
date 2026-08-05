@@ -1,6 +1,6 @@
 # Security Policy
 
-If you discover a security issue, please email **hello@tech1k.com** instead of opening a public issue. I'll respond as soon as I can.
+If you discover a security issue, please report it privately via the [Security tab](https://github.com/EnochT14/hello-esp/security) on GitHub instead of opening a public issue. I'll respond as soon as I can.
 
 ## Scope
 

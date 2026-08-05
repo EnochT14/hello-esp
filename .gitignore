@@ -8,3 +8,4 @@ data/stats/
 data/records/
 *.bak
 *.tmp
+.wrangler

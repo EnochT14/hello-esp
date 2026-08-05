@@ -2,13 +2,13 @@
   "ci": {
     "collect": {
       "url": [
-        "https://helloesp.com/",
-        "https://helloesp.com/guestbook",
-        "https://helloesp.com/history",
-        "https://helloesp.com/console",
-        "https://helloesp.com/about",
-        "https://helloesp.com/snake",
-        "https://helloesp.com/chronicle"
+        "https://esp.ecobbina.work/",
+        "https://esp.ecobbina.work/guestbook",
+        "https://esp.ecobbina.work/history",
+        "https://esp.ecobbina.work/console",
+        "https://esp.ecobbina.work/about",
+        "https://esp.ecobbina.work/snake",
+        "https://esp.ecobbina.work/chronicle"
       ],
       "numberOfRuns": 3
     },

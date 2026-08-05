@@ -1,4 +1,4 @@
-name = "helloesp-relay"
+name = "esp-relay"
 main = "worker.js"
 compatibility_date = "2026-04-08"
 workers_dev = false
@@ -13,7 +13,7 @@ preview_urls = false
 # covers guestbook moderation alerts, dead-man switch, and backup failure / overdue alerts
 #   wrangler secret put SMTP2GO_KEY    # your SMTP2GO api key
 #   wrangler secret put NOTIFY_EMAIL   # where to send alerts
-#   wrangler secret put NOTIFY_FROM    # "HelloESP <noreply@helloesp.com>" (optional)
+#   wrangler secret put NOTIFY_FROM    # "HelloESP <noreply@ecobbina.com>" (optional)
 #
 # (optional) dead-man's-switch threshold; default 6 hours, accepts fractional hours
 #   wrangler secret put DEADMAN_HOURS  # e.g. "12" or "0.5" for testing
@@ -21,16 +21,9 @@ preview_urls = false
 # (optional) R2 backup bucket. If not bound, Worker falls back to emailing the bundle as an
 # attachment. Create the bucket once before deploying:
 #   wrangler r2 bucket create helloesp-backup
-#
-# (optional) X / Twitter auto-post for Chronicle entries. All 4 must be set or the
-# post path silently skips. Use a dedicated app with read+write permission:
-#   wrangler secret put X_API_KEY        # consumer key
-#   wrangler secret put X_API_SECRET     # consumer secret
-#   wrangler secret put X_ACCESS_TOKEN   # access token
-#   wrangler secret put X_ACCESS_SECRET  # access token secret
 
 routes = [
-  { pattern = "helloesp.com", custom_domain = true }
+  { pattern = "esp.ecobbina.work", custom_domain = true }
 ]
 
 [durable_objects]

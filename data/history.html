@@ -5,20 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>History / HelloESP</title>
     <meta name="description" content="Weekly, monthly, and yearly stats archives from HelloESP: visitor charts, sensor extremes, and a Hall of Fame tracking the chip's lifetime records.">
-    <meta name="author" content="Tech1k">
+    <meta name="author" content="EnochT14">
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#2686e6">
     <meta property="og:title" content="History / HelloESP">
     <meta property="og:site_name" content="HelloESP">
     <meta property="og:description" content="Weekly, monthly, and yearly stats archives from HelloESP: visitor charts, sensor extremes, and a Hall of Fame tracking the chip's lifetime records.">
-    <meta property="og:image" content="https://helloesp.com/og-banner.jpg">
+    <meta property="og:image" content="https://esp.ecobbina.work/og-banner.jpg">
     <meta property="og:image:type" content="image/jpeg">
     <meta property="og:image:width" content="1200">
     <meta property="og:image:height" content="630">
     <meta property="og:image:alt" content="HelloESP: a website running on an ESP32">
     <meta property="og:type" content="website">
-    <meta property="og:url" content="https://helloesp.com/history">
-    <link rel="canonical" href="https://helloesp.com/history">
+    <meta property="og:url" content="https://esp.ecobbina.work/history">
+    <link rel="canonical" href="https://esp.ecobbina.work/history">
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="icon" type="image/png" href="/favicon.png">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -348,7 +348,6 @@
         <a class="site-name" href="/"><img src="/favicon.png" alt="" style="height:14px;vertical-align:-1px;margin-right:4px;">HelloESP</a>
         <ul class="top-links">
             <li><a href="/guestbook">Guestbook</a></li>
-            <li><a href="/chronicle">Chronicle</a></li>
             <li><a href="/console">Console</a></li>
             <li><a href="/about">About</a></li>
         </ul>
@@ -384,7 +383,7 @@
 
 <footer>
     <div class="footer-meta">
-        <span>Made by <a href="https://tech1k.com" target="_blank" rel="noopener">Tech1k</a></span>
+        <span>Made by <a href="https://github.com/EnochT14/hello-esp" target="_blank" rel="noopener">EnochT14</a></span>
         <span class="served" id="served-time"></span>
     </div>
     <ul class="footer-links">
@@ -392,9 +391,7 @@
         <li><a href="/guestbook"><i class="fa-solid fa-pen"></i> Guestbook</a></li>
         <li><a href="/console"><i class="fa-solid fa-terminal"></i> Console</a></li>
         <li><a href="/about"><i class="fa-solid fa-circle-info"></i> About</a></li>
-        <li><a href="/snake"><i class="fa-solid fa-gamepad"></i> Snake</a></li>
-        <li><a href="/chronicle"><i class="fa-solid fa-book-open"></i> Chronicle</a></li>
-        <li><a href="https://github.com/Tech1k/helloesp" target="_blank" rel="noopener"><i class="fa-brands fa-github"></i> GitHub</a></li>
+        <li><a href="https://github.com/EnochT14/hello-esp" target="_blank" rel="noopener"><i class="fa-brands fa-github"></i> GitHub</a></li>
     </ul>
 </footer>
 
@@ -511,12 +508,12 @@
         html += '<div><div class="cell-label">Guestbook</div><div class="cell-value">' + fmtInt(data.guestbook) + '</div><div class="cell-sub">entries submitted</div></div>';
         html += '<div><div class="cell-label">Peak requests</div><div class="cell-value">' + fmtInt(data.peak_reqs) + '</div><div class="cell-sub">per 5 min</div></div>';
         if (data.temp_c && Number.isFinite(data.temp_c.min)) {
-            var tminF = (data.temp_c.min * 9/5 + 32).toFixed(1);
-            var tmaxF = (data.temp_c.max * 9/5 + 32).toFixed(1);
-            var tavgF = (data.temp_c.avg * 9/5 + 32).toFixed(1);
+            var tminC = data.temp_c.min.toFixed(1);
+            var tmaxC = data.temp_c.max.toFixed(1);
+            var tavgC = data.temp_c.avg.toFixed(1);
             html += '<div><div class="cell-label">Temperature</div>';
-            html += '<div class="cell-value">' + tminF + '\u2013' + tmaxF + '\u00b0F</div>';
-            html += '<div class="cell-sub">avg ' + tavgF + '\u00b0F</div></div>';
+            html += '<div class="cell-value">' + tminC + '\u2013' + tmaxC + '\u00b0C</div>';
+            html += '<div class="cell-sub">avg ' + tavgC + '\u00b0C</div></div>';
         }
         if (data.humidity && Number.isFinite(data.humidity.min)) {
             html += '<div><div class="cell-label">Humidity</div>';
@@ -769,9 +766,16 @@
                 var v = d >= 1 ? Math.floor(d) + 'd' : Math.round(d * 24) + 'h';
                 rows.push({ label: label, value: v, at: rec.at });
             }
+            // Temperature records are stored in \u00b0F (firmware units);
+            // render them in \u00b0C like the rest of the page.
+            function tempRec(rec) {
+                if (!rec) return null;
+                var c = ((+rec.value) - 32) * 5 / 9;
+                return { value: c, at: rec.at };
+            }
             row('Highest eCO\u2082',     data.highest_co2,       ' ppm',      true);
-            row('Hottest recorded',      data.highest_temp_f,    '\u00b0F',   false);
-            row('Coldest recorded',      data.lowest_temp_f,     '\u00b0F',   false);
+            row('Hottest recorded',      tempRec(data.highest_temp_f), '\u00b0C', false);
+            row('Coldest recorded',      tempRec(data.lowest_temp_f),  '\u00b0C', false);
             row('Busiest day',           data.most_visitors_day, ' visitors', true);
             uptimeRow('Longest uptime',  data.longest_uptime_d);
             // Capture cost rate from records.json so per-period cards can

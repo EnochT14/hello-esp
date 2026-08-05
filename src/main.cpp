@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2026 Kristian Kramer (Tech1k)
+// Copyright (c) 2022-2026 EnochT14 (fork of helloesp, originally by Tech1k)
 // Distributed under the MIT software license
 
 #include "WiFi.h"
@@ -8,13 +8,10 @@
 #include "Wire.h"
 #include "Adafruit_Sensor.h"
 #include "Adafruit_BME280.h"
-#include "Adafruit_GFX.h"
-#include "Adafruit_SSD1306.h"
+#include "U8g2lib.h"
 #include "Adafruit_CCS811.h"
-#include "RTClib.h"
 #include "FS.h"
-#include "SD.h"
-#include "SPI.h"
+#include "LittleFS.h"
 #include "time.h"
 #include "Update.h"
 #include "esp_system.h"
@@ -35,14 +32,17 @@ SET_LOOP_TASK_STACK_SIZE(12 * 1024);
 // Version
 #define FIRMWARE_VERSION "1.4"
 
-// Pins
-#define SD_CS    5
-#define LED_PIN       33
-#define NOTIF_LED_PIN 32
+// Pins - generic ESP32 WROOM-32 dev board (esp32doit-devkit-v1, 4MB flash)
+// I2C (GME12864-78 OLED + BME280 + CCS811): SDA 21, SCL 22 (stock ESP32 I2C
+// pins; neither is a boot-strapping pin, so a sensor that holds its line low
+// at power-up can't trip 1.8V flash mode the way GPIO12 did on the old board)
+// Notification LED: GPIO 2 (onboard blue LED, active-low; HIGH=off)
+#define I2C_SDA  21
+#define I2C_SCL  22
+#define LED_PIN  2
 
 // Config
 #define SEALEVELPRESSURE_HPA 1013.25
-#define LED_ON_TIME          200
 
 char cfgSsid[64]       = "";
 char cfgWifiPass[64]   = "";
@@ -78,6 +78,11 @@ float cfgCo2PerKwh     = 0.0f;
 // flop during transient WS reconnects, giving inconsistent UX. The
 // persisted flag stays the same across reconnects.
 bool cfgWorkerExclusive = false;
+// When false, the dumsor (power outage) tracker is disabled: no /lastseen.txt
+// proof-of-life writes, no boot-gap check, no /power_events.csv rows, and the
+// display page shows an "off" notice. Defaults to on when the config key is
+// absent.
+bool cfgDumsorTracking = true;
 
 const long  gmtOffset_sec      = 0;
 const int   daylightOffset_sec = 0;
@@ -245,12 +250,17 @@ String wsRead(WiFiClientSecure& client) {
 }
 Adafruit_BME280 bme;
 Adafruit_CCS811 ccs;
-Adafruit_SSD1306 display = Adafruit_SSD1306(128, 64, &Wire);
-RTC_DS3231 rtc;
-bool rtcOk = false;
-bool rtcLostPowerAtBoot = false; // latched at boot; survives the rtc.adjust() that clears the live flag
-uint32_t sdSpeedHz = 0;          // captured at mount time; 0 if SD never mounted
-bool oledOk = false;             // captured at display.begin(); cleared on init failure
+// 1.3" GME12864-78 OLED, SH1106 128x64, 4-pin I2C (addr 0x3C), no reset pin.
+// If the panel never initializes, it may be a CH1116/SSD1306-clone: swap
+// U8G2_SH1106_128X64_NONAME_F_HW_I2C for U8G2_SSD1306_128X64_NONAME_F_HW_I2C.
+U8G2_SH1106_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, I2C_SCL, I2C_SDA);
+bool oledOk = false;             // set true after OLED init; cleared on init failure
+
+// All persisted state (config.txt, web assets, logs, stats) lives in the
+// on-chip LittleFS partition (this board has no SD slot). The file API is a
+// drop-in superset of the SD usage, so the rest of the code keeps calling
+// SD.* — this shim reroutes it to flash. Populate with `pio run -t uploadfs`.
+fs::LittleFSFS SD;
 
 // All cached sensor values + degraded-at timestamps are written from the
 // main loop and read from HTTP handlers running on the AsyncTCP task
@@ -321,13 +331,12 @@ void logError(const char* tag, const char* msg);
 // Per-sensor graceful-failure tracker. When a sensor produces no good read
 // for SENSOR_RETIRE_THRESHOLD consecutive logStats cycles (~2.5 hours at
 // the 5-min interval), the chip declares it retired: stops attempting
-// reads, persists the retirement date, and emits a chronicle event so
-// "the day the chip went blind to humidity" becomes part of the archive.
-// Threshold is intentionally conservative: survives I2C glitches, CCS811
-// boot warm-up, transient bus contention. Owner can un-retire from the
-// admin panel after replacing/fixing a sensor. Existing bmeDegraded() /
-// ccsDegraded() timestamp-based degradation logic is unchanged; retire
-// sits on top as a stronger persistent signal.
+// reads and persists the retirement date. Threshold is intentionally
+// conservative: survives I2C glitches, CCS811 boot warm-up, transient bus
+// contention. Owner can un-retire from the admin panel after
+// replacing/fixing a sensor. Existing bmeDegraded() / ccsDegraded()
+// timestamp-based degradation logic is unchanged; retire sits on top as a
+// stronger persistent signal.
 struct SensorHealth {
     uint32_t consecutive_bad;
     bool     retired;
@@ -397,7 +406,7 @@ static bool ccsDegraded() {
 // Atomic tmp+bak+rename pattern matches the rest of the persisted state on
 // SD. Fields are minimal: consecutive_bad isn't persisted (resets on reboot
 // and re-accumulates if the sensor is still bad), only the retired flag +
-// timestamp need to survive across boots so chronicle isn't double-emitted.
+// timestamp need to survive across boots so a retire isn't re-logged.
 static void loadSensorHealth() {
     if (!SD.exists(SENSOR_HEALTH_PATH)) return;
     File f = SD.open(SENSOR_HEALTH_PATH, FILE_READ);
@@ -460,26 +469,11 @@ static void saveSensorHealth() {
     if (SD.exists(bak.c_str())) SD.remove(bak.c_str());
 }
 
-// Emit chronicle event so the worker can mark the day as "the chip went
-// blind to <sensor>". Worker stores under a dedicated DO key so the next
-// chronicle seal can surface it. Fires once per retire transition.
-static void emitChronicleSensorRetired(const char* sensor, uint32_t retireUnix) {
-    if (!wsConnected || !wsClient.connected()) return;
-    String msg;
-    msg.reserve(160);
-    msg  = "{\"type\":\"event\",\"event\":\"chronicle_sensor_retired\",\"data\":{\"sensor\":\"";
-    msg += sensor;
-    msg += "\",\"unix\":";
-    msg += String(retireUnix);
-    msg += "}}";
-    wsSendText(wsClient, msg);
-}
-
 // Called at the end of each logStats cycle (every 5 min). Increments
 // per-sensor consecutive_bad if degraded this cycle, resets on a healthy
-// cycle. Crosses SENSOR_RETIRE_THRESHOLD → retire transition: persist,
-// log, and emit chronicle event. Only fires on the transition itself, so
-// a retired sensor doesn't re-emit on every subsequent cycle.
+// cycle. Crosses SENSOR_RETIRE_THRESHOLD → retire transition: persist and
+// log. Only fires on the transition itself, so a retired sensor doesn't
+// re-emit on every subsequent cycle.
 static void evalSensorHealth() {
     bool dirty = false;
     auto eval = [&](SensorHealth& h, bool degradedNow, const char* name) {
@@ -493,7 +487,6 @@ static void evalSensorHealth() {
                 dirty = true;
                 logError("sensor", (String(name) + " RETIRED after "
                     + String(h.consecutive_bad) + " consecutive bad cycles").c_str());
-                emitChronicleSensorRetired(name, h.retired_unix);
             }
         } else {
             h.consecutive_bad = 0;
@@ -504,8 +497,6 @@ static void evalSensorHealth() {
     if (dirty) saveSensorHealth();
 }
 
-volatile bool          ledOn               = false;
-volatile unsigned long lastRequestTime     = 0;
 int                    lastLoggedMinute    = -1;
 int                    displayPage         = 0;
 
@@ -1239,8 +1230,11 @@ static void checkPeriodBoundaries() {
     }
 }
 unsigned long          lastPageSwitch      = 0;
-#define DISPLAY_PAGES  6
+#define DISPLAY_PAGES  7
 #define PAGE_INTERVAL  10000
+// OLED full-redraw throttle: a 1KB buffer push over 400kHz I2C takes ~20ms,
+// so redraw at most once per second unless the page changed.
+#define RENDER_INTERVAL_MS 1000UL
 
 // HelloESP favicon (32x32)
 const unsigned char logoBitmap[] PROGMEM = {
@@ -1254,30 +1248,30 @@ const unsigned char logoBitmap[] PROGMEM = {
     0x01, 0xce, 0x73, 0x80, 0x01, 0xce, 0x73, 0x80, 0x01, 0xce, 0x73, 0x80, 0x01, 0xce, 0x73, 0x80
 };
 
-// 50x50 QR code for "https://helloesp.com" (2x scaled from 25x25 QR-L)
+// 50x50 QR code for "https://esp.ecobbina.work" (2x scaled from 25x25 QR-L)
 const unsigned char qrBitmap[] PROGMEM = {
-    0xff, 0xfc, 0x3f, 0x3c, 0x0f, 0xff, 0xc0, 0xff, 0xfc, 0x3f, 0x3c, 0x0f, 0xff, 0xc0, 0xc0, 0x0c,
-    0x03, 0xf0, 0x0c, 0x00, 0xc0, 0xc0, 0x0c, 0x03, 0xf0, 0x0c, 0x00, 0xc0, 0xcf, 0xcc, 0x3f, 0x0c,
-    0xcc, 0xfc, 0xc0, 0xcf, 0xcc, 0x3f, 0x0c, 0xcc, 0xfc, 0xc0, 0xcf, 0xcc, 0xcf, 0x33, 0xcc, 0xfc,
-    0xc0, 0xcf, 0xcc, 0xcf, 0x33, 0xcc, 0xfc, 0xc0, 0xcf, 0xcc, 0xcc, 0xf0, 0x0c, 0xfc, 0xc0, 0xcf,
-    0xcc, 0xcc, 0xf0, 0x0c, 0xfc, 0xc0, 0xc0, 0x0c, 0x3c, 0x3c, 0x0c, 0x00, 0xc0, 0xc0, 0x0c, 0x3c,
-    0x3c, 0x0c, 0x00, 0xc0, 0xff, 0xfc, 0xcc, 0xcc, 0xcf, 0xff, 0xc0, 0xff, 0xfc, 0xcc, 0xcc, 0xcf,
-    0xff, 0xc0, 0x00, 0x00, 0x30, 0xcc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xcc, 0x00, 0x00, 0x00,
-    0xf0, 0x3f, 0x3c, 0xff, 0xc0, 0xf0, 0x00, 0xf0, 0x3f, 0x3c, 0xff, 0xc0, 0xf0, 0x00, 0x0f, 0xc3,
-    0xcc, 0x3f, 0x03, 0xff, 0x00, 0x0f, 0xc3, 0xcc, 0x3f, 0x03, 0xff, 0x00, 0x33, 0x0f, 0x33, 0xcf,
-    0xfc, 0x33, 0xc0, 0x33, 0x0f, 0x33, 0xcf, 0xfc, 0x33, 0xc0, 0x3f, 0xc0, 0x0f, 0x0f, 0x3c, 0xf0,
-    0xc0, 0x3f, 0xc0, 0x0f, 0x0f, 0x3c, 0xf0, 0xc0, 0x00, 0xcc, 0xfc, 0x3f, 0x0f, 0x00, 0xc0, 0x00,
-    0xcc, 0xfc, 0x3f, 0x0f, 0x00, 0xc0, 0xcc, 0xf0, 0x3c, 0xf3, 0xc3, 0x03, 0x00, 0xcc, 0xf0, 0x3c,
-    0xf3, 0xc3, 0x03, 0x00, 0xc3, 0x3f, 0xc0, 0x3f, 0xf3, 0xf3, 0xc0, 0xc3, 0x3f, 0xc0, 0x3f, 0xf3,
-    0xf3, 0xc0, 0xc0, 0xc3, 0xfc, 0xfc, 0x0f, 0x3c, 0xc0, 0xc0, 0xc3, 0xfc, 0xfc, 0x0f, 0x3c, 0xc0,
-    0xcf, 0x3c, 0x3c, 0xcf, 0xff, 0xcc, 0x00, 0xcf, 0x3c, 0x3c, 0xcf, 0xff, 0xcc, 0x00, 0x00, 0x00,
-    0xcc, 0x00, 0xc0, 0xc0, 0x00, 0x00, 0x00, 0xcc, 0x00, 0xc0, 0xc0, 0x00, 0xff, 0xfc, 0xcc, 0xfc,
-    0xcc, 0xc0, 0xc0, 0xff, 0xfc, 0xcc, 0xfc, 0xcc, 0xc0, 0xc0, 0xc0, 0x0c, 0xff, 0x0f, 0xc0, 0xc0,
-    0xc0, 0xc0, 0x0c, 0xff, 0x0f, 0xc0, 0xc0, 0xc0, 0xcf, 0xcc, 0x03, 0x03, 0xff, 0xcf, 0xc0, 0xcf,
-    0xcc, 0x03, 0x03, 0xff, 0xcf, 0xc0, 0xcf, 0xcc, 0x30, 0xf3, 0x3c, 0x03, 0xc0, 0xcf, 0xcc, 0x30,
-    0xf3, 0x3c, 0x03, 0xc0, 0xcf, 0xcc, 0x0c, 0x3c, 0xc0, 0x3c, 0xc0, 0xcf, 0xcc, 0x0c, 0x3c, 0xc0,
-    0x3c, 0xc0, 0xc0, 0x0c, 0xcc, 0xf0, 0xf3, 0xc0, 0xc0, 0xc0, 0x0c, 0xcc, 0xf0, 0xf3, 0xc0, 0xc0,
-    0xff, 0xfc, 0xf3, 0xf0, 0xfc, 0x30, 0xc0, 0xff, 0xfc, 0xf3, 0xf0, 0xfc, 0x30, 0xc0
+    0xff, 0x3f, 0x0c, 0xff, 0xf0, 0xff, 0x03, 0xff, 0x3f, 0x0c, 0xff, 0xf0, 0xff, 0x03, 0x03, 0x30, 0xf0,
+    0xcf, 0x30, 0x00, 0x03, 0x03, 0x30, 0xf0, 0xcf, 0x30, 0x00, 0x03, 0xf3, 0x33, 0x3f, 0xc3, 0x33, 0x3f,
+    0x03, 0xf3, 0x33, 0x3f, 0xc3, 0x33, 0x3f, 0x03, 0xf3, 0x33, 0xfc, 0xf0, 0x30, 0x3f, 0x03, 0xf3, 0x33,
+    0xfc, 0xf0, 0x30, 0x3f, 0x03, 0xf3, 0x33, 0x30, 0xfc, 0x30, 0x3f, 0x03, 0xf3, 0x33, 0x30, 0xfc, 0x30,
+    0x3f, 0x03, 0x03, 0x30, 0x0c, 0xf0, 0x30, 0x00, 0x03, 0x03, 0x30, 0x0c, 0xf0, 0x30, 0x00, 0x03, 0xff,
+    0x3f, 0x33, 0x33, 0xf3, 0xff, 0x03, 0xff, 0x3f, 0x33, 0x33, 0xf3, 0xff, 0x03, 0x00, 0x00, 0x3f, 0x0f,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x0f, 0x00, 0x00, 0x00, 0x3f, 0xff, 0xf3, 0x0c, 0x3f, 0x30, 0x00,
+    0x3f, 0xff, 0xf3, 0x0c, 0x3f, 0x30, 0x00, 0xf0, 0x0c, 0xf3, 0x0c, 0x33, 0x00, 0x03, 0xf0, 0x0c, 0xf3,
+    0x0c, 0x33, 0x00, 0x03, 0xf0, 0xf3, 0x0f, 0x30, 0xf0, 0xf3, 0x03, 0xf0, 0xf3, 0x0f, 0x30, 0xf0, 0xf3,
+    0x03, 0xf0, 0x0f, 0xc0, 0x3c, 0x33, 0xc0, 0x00, 0xf0, 0x0f, 0xc0, 0x3c, 0x33, 0xc0, 0x00, 0xff, 0xf0,
+    0x00, 0xff, 0x3f, 0xcc, 0x03, 0xff, 0xf0, 0x00, 0xff, 0x3f, 0xcc, 0x03, 0xcc, 0xc0, 0xc0, 0x03, 0x33,
+    0x0c, 0x03, 0xcc, 0xc0, 0xc0, 0x03, 0x33, 0x0c, 0x03, 0xc3, 0x3c, 0xcc, 0x0f, 0xf0, 0xf0, 0x03, 0xc3,
+    0x3c, 0xcc, 0x0f, 0xf0, 0xf0, 0x03, 0xcc, 0x03, 0x0c, 0x0f, 0x0c, 0xc3, 0x00, 0xcc, 0x03, 0x0c, 0x0f,
+    0x0c, 0xc3, 0x00, 0xf3, 0x30, 0xcc, 0x0f, 0xff, 0x0f, 0x00, 0xf3, 0x30, 0xcc, 0x0f, 0xff, 0x0f, 0x00,
+    0x00, 0x00, 0xff, 0xfc, 0x03, 0xcf, 0x03, 0x00, 0x00, 0xff, 0xfc, 0x03, 0xcf, 0x03, 0xff, 0x3f, 0x03,
+    0xcc, 0x33, 0xcf, 0x03, 0xff, 0x3f, 0x03, 0xcc, 0x33, 0xcf, 0x03, 0x03, 0x30, 0x33, 0x3c, 0x03, 0x0f,
+    0x00, 0x03, 0x30, 0x33, 0x3c, 0x03, 0x0f, 0x00, 0xf3, 0x33, 0xcf, 0x0f, 0xff, 0x0f, 0x00, 0xf3, 0x33,
+    0xcf, 0x0f, 0xff, 0x0f, 0x00, 0xf3, 0x33, 0x0c, 0x03, 0xcc, 0x3f, 0x00, 0xf3, 0x33, 0x0c, 0x03, 0xcc,
+    0x3f, 0x00, 0xf3, 0x33, 0x33, 0xcf, 0x03, 0x03, 0x03, 0xf3, 0x33, 0x33, 0xcf, 0x03, 0x03, 0x03, 0x03,
+    0x30, 0x33, 0xfc, 0x33, 0xcf, 0x00, 0x03, 0x30, 0x33, 0xfc, 0x33, 0xcf, 0x00, 0xff, 0x3f, 0x3f, 0xcc,
+    0xc3, 0xc0, 0x03, 0xff, 0x3f, 0x3f, 0xcc, 0xc3, 0xc0, 0x03
+
 };
 
 volatile int           requestsThisInterval = 0;
@@ -1288,7 +1282,7 @@ int                    lastVisitorDay      = -1;
 // peaks that occur near midnight get dated correctly even if updateRecords() runs after the
 // day boundary before the next visitor would have reset the counter.
 char                   dailyVisitorsDate[11] = "";
-float                  cachedSdUsedMB      = 0;
+float                  cachedFsUsedMB      = 0;
 volatile int           pendingGuestbook    = 0;  // count of status=0 (new/unreviewed)
 volatile int           gbCountApproved     = 0;  // count of status=1
 volatile int           gbCountDenied       = 0;  // count of status=2
@@ -1300,6 +1294,26 @@ char                   notifyEntryName[33]    = "";
 char                   notifyEntryCountry[4]  = "";
 char                   notifyEntryMessage[201]= "";
 time_t                 bootTime            = 0;
+
+// Dumsor (Ghana grid outage) tracking. There is no RTC on this build, so the
+// device measures power-off duration by comparing the epoch written to SD as a
+// periodic proof-of-life against the NTP time captured after the next boot.
+// /lastseen.txt holds the last alive epoch; /power_events.csv logs each
+// detected gap (outage_start, power_restored, down_seconds).
+#define LASTSEEN_PATH        "/lastseen.txt"
+#define POWER_EVENTS_CSV     "/power_events.csv"
+#define POWER_EVENTS_MAX     500         // rows kept; oldest pruned
+#define LASTSEEN_INTERVAL_MS 300000UL    // proof-of-life cadence (5 min, matches CSV logging)
+#define OUTAGE_MIN_SECS      90          // smaller gaps are reboots / NTP jitter
+#define OUTAGE_MAX_SECS      (180UL * 86400UL) // sanity ceiling (~6 months)
+bool                     dumsorBootChecked   = false;
+unsigned long            lastLastSeenWrite   = 0;
+uint32_t                 dumsorOutagesTotal  = 0;
+uint32_t                 dumsorOutagesMonth  = 0;
+uint64_t                 dumsorSecondsTotal  = 0;
+uint64_t                 dumsorSecondsMonth  = 0;
+uint32_t                 dumsorLastOutageSecs = 0;
+time_t                   dumsorLastOutageAt  = 0;  // epoch when power returned
 
 volatile bool          pendingMaintenanceFlag     = false;
 int                    pendingMaintenanceMinutes  = 0;
@@ -1320,7 +1334,6 @@ volatile bool          pendingConsolePush         = false;
 #define LAST_COMMIT_TMP    "/stats/last_commit.tmp"
 
 volatile bool          pendingBackupFlag          = false;
-
 // Timestamp of the last multipart upload/OTA chunk we saw.
 volatile unsigned long lastUploadChunkMs          = 0;
 // Set by the /_upload chunk handler when the target file already exists and
@@ -1352,9 +1365,6 @@ char                   r2HealthcheckDetail[129]   = "";
 
 // Admin-triggered SMTP2GO test. Catches silent email-integration failures before a real alert fires.
 volatile bool          pendingTestEmailFlag       = false;
-volatile bool          pendingSnakeClearFlag      = false;
-uint32_t               snakeClearAtUnix           = 0;
-bool                   snakeClearOk               = false;
 uint32_t               testEmailAtUnix            = 0;
 bool                   testEmailPass              = false;
 char                   testEmailDetail[129]       = "";
@@ -1462,8 +1472,7 @@ static bool consoleShouldSkip(const String& url) {
     if (url == "/.well-known/security.txt") return true;
     // static assets
     if (url == "/favicon.png" || url == "/favicon.svg" || url == "/og-banner.jpg") return true;
-    if (url == "/helloesp-framed.jpg" || url == "/helloesp-framed-2026-04.jpg" || url == "/helloesp-boot.mp4" || url == "/helloesp-boot-poster.jpg") return true;
-    if (url == "/esp32-webserver.jpg" || url == "/esp32-webserver-bme280.jpg" || url == "/esp8266-webserver.jpg") return true;
+    if (url == "/esp32-current.jpg" || url == "/esp32-location.jpg") return true;
     return false;
 }
 
@@ -1473,11 +1482,8 @@ static void logConsole(AsyncWebServerRequest *req, int status) {
     // HEAD requests are monitoring probes / CDN health checks, not real page visits
     if (req->method() == HTTP_HEAD) return;
 
-    // LED blinks on any page visit. Sits above the CF-header/404 filters
-    // so LAN tests and 404s still blink.
-    digitalWrite(LED_PIN, HIGH);
-    ledOn = true;
-    lastRequestTime = millis();
+    // (No request-blink: the single notification LED is alerts-only — solid
+    // for pending guestbook, 1Hz blink for degraded sensors.)
 
     // LAN-origin requests (owner testing) don't have CF-Connecting-IP and would show "??".
     // The public console is meant to reflect public traffic, not local noise.
@@ -1816,8 +1822,6 @@ static bool isProtectedPath(const String& p) {
         || p == "/guestbook.html"
         || p == "/history.html"
         || p == "/console.html"
-        || p == "/snake.html"
-        || p == "/chronicle.html"
         || p == "/admin.html"
         || p == "/404.html";
 }
@@ -1955,6 +1959,179 @@ String getLogFilename() {
     if (!SD.exists(yearDir)) SD.mkdir(yearDir);
     strftime(buf, sizeof(buf), "/logs/%Y/%Y-%m-%d.csv", &timeinfo);
     return String(buf);
+}
+
+// --- Dumsor power-outage tracking -----------------------------------------
+
+static time_t dumsorReadLastSeen() {
+    if (!SD.exists(LASTSEEN_PATH)) return 0;
+    File f = SD.open(LASTSEEN_PATH, FILE_READ);
+    if (!f) return 0;
+    char buf[20] = "";
+    size_t n = f.read((uint8_t*)buf, sizeof(buf) - 1);
+    f.close();
+    if (n == 0) return 0;
+    char* end = nullptr;
+    long long v = strtoll(buf, &end, 10);
+    if (!end || end == buf || v <= 0) return 0;
+    return (time_t)v;
+}
+
+static void dumsorWriteLastSeen(time_t t) {
+    if (t <= 0) return;
+    File f = SD.open(LASTSEEN_PATH, FILE_WRITE);
+    if (!f) return;
+    f.printf("%lld\n", (long long)t);
+    f.close();
+}
+
+// Append one outage row and keep the file bounded (header + newest rows).
+static void dumsorAppendEvent(time_t from, time_t to, uint32_t secs) {
+    File f = SD.open(POWER_EVENTS_CSV, FILE_APPEND);
+    if (!f) {
+        logError("dumsor", "power_events.csv append failed");
+        return;
+    }
+    if (f.size() == 0) f.println("outage_start_unix,power_restored_unix,down_seconds");
+    f.printf("%lld,%lld,%u\n", (long long)from, (long long)to, secs);
+    f.close();
+
+    // Trim: drop oldest data rows, keep header + newest POWER_EVENTS_MAX.
+    if (!SD.exists(POWER_EVENTS_CSV)) return;
+    File chk = SD.open(POWER_EVENTS_CSV, FILE_READ);
+    if (!chk) return;
+    int lines = 0;
+    while (chk.available()) { if (chk.read() == '\n') lines++; }
+    chk.close();
+    if (lines <= POWER_EVENTS_MAX) return;
+
+    int skip = lines - (POWER_EVENTS_MAX - 1);
+    File src = SD.open(POWER_EVENTS_CSV, FILE_READ);
+    if (!src) return;
+    File dst = SD.open("/power_events.tmp", FILE_WRITE);
+    if (!dst) { src.close(); return; }
+    int seen = 0;
+    bool skipping = true;
+    uint8_t buf[512];
+    while (src.available()) {
+        size_t n = src.read(buf, sizeof(buf));
+        for (size_t i = 0; i < n; i++) {
+            if (skipping) {
+                if (seen == 0) dst.write(buf[i]); // always keep the header line
+                if (buf[i] == '\n' && ++seen >= skip) skipping = false;
+            } else {
+                dst.write(buf[i]);
+            }
+        }
+    }
+    src.close();
+    dst.close();
+    SD.remove(POWER_EVENTS_CSV);
+    if (!SD.rename("/power_events.tmp", POWER_EVENTS_CSV))
+        logError("dumsor", "trim rename failed");
+}
+
+// Tally total + this-month outages for the display/stats (called once per boot).
+static void dumsorLoadCounts(time_t now) {
+    dumsorOutagesTotal = 0;
+    dumsorOutagesMonth = 0;
+    dumsorSecondsTotal = 0;
+    dumsorSecondsMonth = 0;
+    if (!SD.exists(POWER_EVENTS_CSV)) return;
+    File f = SD.open(POWER_EVENTS_CSV, FILE_READ);
+    if (!f) return;
+    struct tm nowTm;
+    localtime_r(&now, &nowTm);
+    String line;
+    while (f.available()) {
+        char c = (char)f.read();
+        if (c == '\n' || !f.available()) {
+            if (c != '\n') line += c;
+            if (line.length() >= 10 && line.charAt(0) != 'o') { // skip header
+                char buf[24];
+                long long secs = 0;
+                time_t ev = 0;
+                int comma = line.indexOf(',');
+                line.substring(0, comma).toCharArray(buf, sizeof(buf));
+                char* end = nullptr;
+                long long start = strtoll(buf, &end, 10);
+                if (!(end && end != buf && start > 0)) { line = ""; }
+                else {
+                    ev = (time_t)start;
+                    int comma2 = comma >= 0 ? line.indexOf(',', comma + 1) : -1;
+                    if (comma2 > 0) {
+                        String secField = line.substring(comma2 + 1);
+                        secField.trim();
+                        secField.toCharArray(buf, sizeof(buf));
+                        end = nullptr;
+                        long long d = strtoll(buf, &end, 10);
+                        secs = (end && end != buf && d > 0) ? d : 0;
+                    }
+                    if (secs <= 0) {
+                        // Fall back to restored - start when the seconds column
+                        // is missing (pre-v1 lines): bounds-check like the writer.
+                        long long restored = 0;
+                        if (comma >= 0) {
+                            int comma3 = line.indexOf(',', comma + 1);
+                            if (comma3 > 0) {
+                                line.substring(comma + 1, comma3).toCharArray(buf, sizeof(buf));
+                                end = nullptr;
+                                restored = strtoll(buf, &end, 10);
+                            }
+                            if (restored > start) secs = restored - start;
+                        }
+                    }
+                    if (secs >= OUTAGE_MIN_SECS && secs <= OUTAGE_MAX_SECS) {
+                        struct tm et;
+                        localtime_r(&ev, &et);
+                        dumsorOutagesTotal++;
+                        dumsorSecondsTotal += (uint64_t)secs;
+                        if (et.tm_year == nowTm.tm_year && et.tm_mon == nowTm.tm_mon) {
+                            dumsorOutagesMonth++;
+                            dumsorSecondsMonth += (uint64_t)secs;
+                        }
+                    }
+                }
+            }
+            line = "";
+        } else {
+            line += c;
+        }
+    }
+    f.close();
+}
+
+// Check once per boot (after NTP lands) whether a power gap is detectable.
+// Idempotent: latches on the first call that has a valid clock; if NTP is
+// still pending it returns without latching and the caller retries.
+static void dumsorCheckBootGap() {
+    if (dumsorBootChecked) return;
+    struct tm tNow;
+    if (!getLocalTime(&tNow, 0)) return;
+    time_t now = mktime(&tNow);
+    dumsorBootChecked = true;
+
+    time_t last = dumsorReadLastSeen();
+    if (last <= 0 || last >= now) {
+        dumsorWriteLastSeen(now); // first boot or clock ran ahead; just seed
+        dumsorLoadCounts(now);
+        return;
+    }
+    time_t gap = now - last;
+    dumsorLoadCounts(now);
+    if (gap >= OUTAGE_MIN_SECS && gap <= OUTAGE_MAX_SECS) {
+        dumsorAppendEvent(last, now, (uint32_t)gap);
+        dumsorLastOutageAt = now;
+        dumsorLastOutageSecs = (uint32_t)gap;
+        // Reload so total / this-month downtime include the event just
+        // appended (the load above reflects the pre-append CSV).
+        dumsorLoadCounts(now);
+        Serial.printf("[dumsor] power was off ~%llus (from %lld to %lld)\n",
+                      (long long)gap, (long long)last, (long long)now);
+        String emsg = "power outage detected: ~" + String((long)gap) + "s";
+        logError("dumsor", emsg.c_str());
+    }
+    dumsorWriteLastSeen(now);
 }
 
 // Error log: single file at /logs/errors.log, rolls over to .old at 64 KB.
@@ -2155,15 +2332,13 @@ static bool writeGuestbookSchemaVersion(int v) {
 static void migrationAbort(const char* msg) {
     Serial.printf("[migrate] ABORT: %s\n", msg);
     logError("migrate", msg);
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println(F("MIGRATION FAILED"));
-    display.println(F("Power off + check"));
-    display.println(F("SD card."));
-    display.println();
-    display.println(msg);
-    display.display();
+    display.clearBuffer();
+    display.setFont(u8g2_font_6x13_tf);
+    display.drawStr(0, 10, "MIGRATION FAILED");
+    display.drawStr(0, 26, "Power off + check");
+    display.drawStr(0, 42, "LittleFS.");
+    display.drawStr(0, 58, msg);
+    display.sendBuffer();
     while (1) { delay(1000); }
 }
 
@@ -2589,7 +2764,7 @@ String buildStatsJson() {
         ",\"voc_ppb\":%u"
         ",\"countries\":%d"
         ",\"guestbook_approved\":%d"
-        ",\"sensors\":{\"bme_ok\":%s,\"ccs_ok\":%s,\"oled_ok\":%s,\"rtc_ok\":%s}"
+        ",\"sensors\":{\"bme_ok\":%s,\"ccs_ok\":%s,\"oled_ok\":%s}"
         ",\"today_local\":\"%s\""
         ",\"today_local_hour\":%d"
         "}",
@@ -2615,7 +2790,6 @@ String buildStatsJson() {
         bmeDegraded() ? "false" : "true",
         ccsDegraded() ? "false" : "true",
         oledOk ? "true" : "false",
-        rtcOk ? "true" : "false",
         today_local,
         today_local_hour);
 
@@ -2639,6 +2813,22 @@ String buildStatsJson() {
             today_energy_wh,
             lifetime_energy_wh);
         out += ext;
+        return out;
+    }
+
+    // Dumsor power-outage block (always present; zeros until first recorded
+    // outage). Follows the same insert-before-closing-brace pattern as Shelly.
+    {
+        String out(buf);
+        if (out.endsWith("}")) out.remove(out.length() - 1);
+        char ext[192];
+        snprintf(ext, sizeof(ext),
+            ",\"dumsor\":{\"outage_secs\":%u,\"outage_at\":%lld,\"outages_total\":%u,\"outages_month\":%u,\"seconds_total\":%llu,\"seconds_month\":%llu}",
+            dumsorLastOutageSecs, (long long)dumsorLastOutageAt,
+            dumsorOutagesTotal, dumsorOutagesMonth,
+            (unsigned long long)dumsorSecondsTotal, (unsigned long long)dumsorSecondsMonth);
+        out += ext;
+        out += "}";
         return out;
     }
     return String(buf);
@@ -3014,20 +3204,12 @@ static bool tryDirectStaticServe(int reqId, const char* method,
         {"/",          "/index.html",      "text/html",     "public, max-age=300"},
         {"/about",     "/about.html",      "text/html",     "public, max-age=300"},
         {"/console",   "/console.html",    "text/html",     "public, max-age=300"},
-        {"/snake",     "/snake.html",      "text/html",     "public, max-age=300"},
-        {"/chronicle", "/chronicle.html",  "text/html",     "public, max-age=300"},
-        {"/history",   "/history.html",    "text/html",     "public, max-age=300"},
         {"/guestbook", "/guestbook.html",  "text/html",     "public, max-age=300"},
         {"/favicon.png",                 "/favicon.png",                 "image/png",     "public, max-age=86400"},
         {"/favicon.svg",                 "/favicon.svg",                 "image/svg+xml", "public, max-age=86400"},
         {"/og-banner.jpg",               "/og-banner.jpg",               "image/jpeg",    "public, max-age=86400"},
-        {"/esp32-webserver.jpg",         "/esp32-webserver.jpg",         "image/jpeg",    "public, max-age=86400"},
-        {"/esp32-webserver-bme280.jpg",  "/esp32-webserver-bme280.jpg",  "image/jpeg",    "public, max-age=86400"},
-        {"/esp8266-webserver.jpg",       "/esp8266-webserver.jpg",       "image/jpeg",    "public, max-age=86400"},
-        {"/helloesp-framed.jpg",         "/helloesp-framed.jpg",         "image/jpeg",    "public, max-age=86400"},
-        {"/helloesp-framed-2026-04.jpg", "/helloesp-framed-2026-04.jpg", "image/jpeg",    "public, max-age=86400"},
-        {"/helloesp-boot.mp4",           "/helloesp-boot.mp4",           "video/mp4",     "public, max-age=86400"},
-        {"/helloesp-boot-poster.jpg",    "/helloesp-boot-poster.jpg",    "image/jpeg",    "public, max-age=86400"},
+        {"/esp32-current.jpg",           "/esp32-current.jpg",           "image/jpeg",    "public, max-age=86400"},
+        {"/esp32-location.jpg",          "/esp32-location.jpg",          "image/jpeg",    "public, max-age=86400"},
     };
     const StaticMap* match = nullptr;
     for (auto& s : STATICS) {
@@ -3127,14 +3309,6 @@ void handleWsRelay(String& data) {
             data = "";
             return;
         }
-        if (data.indexOf("\"event\":\"snake_clear_result\"") >= 0) {
-            int p1 = data.indexOf("\"ok\":");
-            if (p1 >= 0) snakeClearOk = (data.indexOf("true", p1) == p1 + 5);
-            struct tm tm;
-            if (getLocalTime(&tm, 0)) snakeClearAtUnix = mktime(&tm);
-            data = "";
-            return;
-        }
         if (data.indexOf("\"event\":\"r2_healthcheck_result\"") >= 0) {
             int p1 = data.indexOf("\"pass\":");
             if (p1 >= 0) {
@@ -3153,160 +3327,6 @@ void handleWsRelay(String& data) {
             }
             struct tm tm;
             if (getLocalTime(&tm, 0)) r2HealthcheckAtUnix = mktime(&tm);
-            data = "";
-            return;
-        }
-        if (data.indexOf("\"event\":\"chronicle_seal\"") >= 0) {
-            // Worker pushes a sealed Chronicle entry for SD persistence so
-            // the chip owns its own diary (and the existing daily SD->R2
-            // backup loop catches it for free). The "entry" field is the
-            // full entry as a stringified JSON value (escapes preserve the
-            // inner quotes) so we can extract and write it without parsing
-            // the nested object structure.
-            int dStart = data.indexOf("\"date\":\"");
-            if (dStart < 0) { data = ""; return; }
-            dStart += 8;
-            int dEnd = data.indexOf("\"", dStart);
-            if (dEnd < 0 || dEnd - dStart != 10) { data = ""; return; }
-            String date = data.substring(dStart, dEnd);
-            // Strict YYYY-MM-DD digit check before using the date in a path.
-            bool dateOk = true;
-            for (int i = 0; i < 10 && dateOk; i++) {
-                char c = date[i];
-                if (i == 4 || i == 7) { if (c != '-') dateOk = false; }
-                else if (c < '0' || c > '9') dateOk = false;
-            }
-            if (!dateOk) { data = ""; return; }
-
-            // Walk past escape sequences to find the unescaped closing quote.
-            int eStart = data.indexOf("\"entry\":\"", dEnd);
-            if (eStart < 0) { data = ""; return; }
-            eStart += 9;
-            int eEnd = -1;
-            for (int i = eStart; i < (int)data.length(); i++) {
-                char c = data[i];
-                if (c == '\\' && i + 1 < (int)data.length()) { i++; continue; }
-                if (c == '"') { eEnd = i; break; }
-            }
-            if (eEnd < 0) { data = ""; return; }
-
-            // Unescape standard JSON string escapes. \uXXXX is decoded to
-            // UTF-8 so owner notes with unicode survive the round trip.
-            String entryJson;
-            entryJson.reserve(eEnd - eStart);
-            for (int i = eStart; i < eEnd; i++) {
-                char c = data[i];
-                if (c != '\\' || i + 1 >= eEnd) { entryJson += c; continue; }
-                char n = data[++i];
-                if (n == '"')      entryJson += '"';
-                else if (n == '\\') entryJson += '\\';
-                else if (n == '/')  entryJson += '/';
-                else if (n == 'n')  entryJson += '\n';
-                else if (n == 'r')  entryJson += '\r';
-                else if (n == 't')  entryJson += '\t';
-                else if (n == 'b')  entryJson += '\b';
-                else if (n == 'f')  entryJson += '\f';
-                else if (n == 'u' && i + 4 < eEnd) {
-                    unsigned int cp = 0;
-                    bool hexOk = true;
-                    for (int k = 0; k < 4 && hexOk; k++) {
-                        char h = data[i + 1 + k];
-                        cp <<= 4;
-                        if      (h >= '0' && h <= '9') cp |= h - '0';
-                        else if (h >= 'a' && h <= 'f') cp |= h - 'a' + 10;
-                        else if (h >= 'A' && h <= 'F') cp |= h - 'A' + 10;
-                        else hexOk = false;
-                    }
-                    if (hexOk) {
-                        i += 4;
-                        // Surrogate pair: 0xD800-0xDBFF must be followed by
-                        // a low surrogate \uDC00-\uDFFF to form a non-BMP
-                        // codepoint (emoji etc.). Without this combine,
-                        // each half encodes as invalid UTF-8.
-                        if (cp >= 0xD800 && cp <= 0xDBFF
-                            && i + 6 < eEnd
-                            && data[i + 1] == '\\' && data[i + 2] == 'u') {
-                            unsigned int low = 0;
-                            bool lowOk = true;
-                            for (int k = 0; k < 4 && lowOk; k++) {
-                                char h = data[i + 3 + k];
-                                low <<= 4;
-                                if      (h >= '0' && h <= '9') low |= h - '0';
-                                else if (h >= 'a' && h <= 'f') low |= h - 'a' + 10;
-                                else if (h >= 'A' && h <= 'F') low |= h - 'A' + 10;
-                                else lowOk = false;
-                            }
-                            if (lowOk && low >= 0xDC00 && low <= 0xDFFF) {
-                                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-                                i += 6; // skip "\uXXXX" of the low surrogate
-                            }
-                        }
-                        if (cp < 0x80) entryJson += (char)cp;
-                        else if (cp < 0x800) {
-                            entryJson += (char)(0xC0 | (cp >> 6));
-                            entryJson += (char)(0x80 | (cp & 0x3F));
-                        } else if (cp < 0x10000) {
-                            entryJson += (char)(0xE0 | (cp >> 12));
-                            entryJson += (char)(0x80 | ((cp >> 6) & 0x3F));
-                            entryJson += (char)(0x80 | (cp & 0x3F));
-                        } else {
-                            entryJson += (char)(0xF0 | (cp >> 18));
-                            entryJson += (char)(0x80 | ((cp >> 12) & 0x3F));
-                            entryJson += (char)(0x80 | ((cp >> 6) & 0x3F));
-                            entryJson += (char)(0x80 | (cp & 0x3F));
-                        }
-                    } else {
-                        entryJson += '\\';
-                        entryJson += n;
-                    }
-                }
-                else { entryJson += '\\'; entryJson += n; }
-            }
-
-            // Atomic write using the project-standard tmp + bak + rename
-            // pattern (matches flushPeriod and other critical writes). Any
-            // mid-write power loss either keeps the previous version (.bak
-            // is the previous good copy until rename succeeds) or leaves
-            // the worker's next sync request as the recovery path. Never
-            // a window where the entry is permanently gone.
-            if (!SD.exists("/chronicle") && !SD.mkdir("/chronicle")) {
-                logError("chronicle", "mkdir /chronicle failed");
-                data = "";
-                return;
-            }
-            // Year-subdirectory grouping keeps each chronicle dir bounded at
-            // ~366 entries so FAT32 traversal stays fast for decades. Year is
-            // the first 4 chars of the validated YYYY-MM-DD date.
-            String yearDir = "/chronicle/" + date.substring(0, 4);
-            if (!SD.exists(yearDir.c_str()) && !SD.mkdir(yearDir.c_str())) {
-                logError("chronicle", ("mkdir " + yearDir + " failed").c_str());
-                data = "";
-                return;
-            }
-            String path = yearDir + "/" + date + ".json";
-            String tmpPath = path + ".tmp";
-            String bakPath = path + ".bak";
-            File f = SD.open(tmpPath.c_str(), FILE_WRITE);
-            if (!f) {
-                logError("chronicle", "open .tmp for chronicle write failed");
-                data = "";
-                return;
-            }
-            f.print(entryJson);
-            f.close();
-            // Stash existing .json as .bak so the previous version stays
-            // recoverable until the new rename succeeds.
-            if (SD.exists(bakPath.c_str())) SD.remove(bakPath.c_str());
-            if (SD.exists(path.c_str())) SD.rename(path.c_str(), bakPath.c_str());
-            if (!SD.rename(tmpPath.c_str(), path.c_str())) {
-                logError("chronicle", "rename .tmp to .json failed");
-                // Recovery: restore the previous version we just stashed.
-                if (SD.exists(bakPath.c_str())) SD.rename(bakPath.c_str(), path.c_str());
-                data = "";
-                return;
-            }
-            // New version is in place, drop the stash.
-            if (SD.exists(bakPath.c_str())) SD.remove(bakPath.c_str());
             data = "";
             return;
         }
@@ -3624,216 +3644,6 @@ static void migrateLegacyToYearSubdir(const char* parentDir, const char* logTag)
     }
 }
 
-// Boot-time orphan cleanup for /chronicle/. Mirrors the recovery logic
-// the other tmp+bak+rename writers do on first access. Called once after
-// SD init in setup(). For each leftover from an interrupted write:
-//   - .tmp files: incomplete writes from a power loss mid-write. Discard;
-//     the worker's catch-up sync will re-push the entry next reconnect.
-//   - .bak files: stash of the previous version. If matching .json exists,
-//     the rename succeeded and .bak is just stale cleanup. If no .json,
-//     a mid-rename crash left only .bak; restore it as .json so the entry
-//     survives even without worker connectivity.
-//
-// Walks both year subdirs (/chronicle/YYYY/) and the root (legacy entries
-// pre-migration) so a crash during migration leaves no orphans behind.
-static void chronicleStartupRecovery() {
-    if (!SD.exists("/chronicle")) return;
-    // Cap at 64 each: more than enough for realistic crash patterns (typical
-    // is 0 or 1) without unbounded heap growth on a corrupted directory.
-    const int MAX_RECOVERY = 64;
-    String tmpPaths[MAX_RECOVERY];
-    String bakPaths[MAX_RECOVERY];
-    int tmpCount = 0, bakCount = 0;
-
-    auto collectFromDir = [&](const String& dirPath) {
-        File dir = SD.open(dirPath.c_str());
-        if (!dir) return;
-        if (!dir.isDirectory()) { dir.close(); return; }
-        File entry = dir.openNextFile();
-        while (entry) {
-            String name = entry.name();
-            int slash = name.lastIndexOf('/');
-            String base = (slash >= 0) ? name.substring(slash + 1) : name;
-            bool isDir = entry.isDirectory();
-            entry.close();
-            if (!isDir) {
-                String full = dirPath + "/" + base;
-                if (base.endsWith(".tmp") && tmpCount < MAX_RECOVERY) tmpPaths[tmpCount++] = full;
-                else if (base.endsWith(".bak") && bakCount < MAX_RECOVERY) bakPaths[bakCount++] = full;
-            }
-            entry = dir.openNextFile();
-        }
-        dir.close();
-    };
-
-    // Collect from year subdirs first, then root (legacy stragglers).
-    File root = SD.open("/chronicle");
-    if (root) {
-        if (root.isDirectory()) {
-            File entry = root.openNextFile();
-            while (entry) {
-                String name = entry.name();
-                int slash = name.lastIndexOf('/');
-                String base = (slash >= 0) ? name.substring(slash + 1) : name;
-                bool isDir = entry.isDirectory();
-                entry.close();
-                if (isDir) {
-                    bool yearOk = (base.length() == 4);
-                    for (int i = 0; i < 4 && yearOk; i++) {
-                        if (base[i] < '0' || base[i] > '9') yearOk = false;
-                    }
-                    if (yearOk) collectFromDir("/chronicle/" + base);
-                }
-                entry = root.openNextFile();
-            }
-        }
-        root.close();
-    }
-    collectFromDir(String("/chronicle"));
-
-    for (int i = 0; i < tmpCount; i++) {
-        SD.remove(tmpPaths[i].c_str());
-        Serial.printf("[chronicle] recovery: discarded orphan %s\n", tmpPaths[i].c_str());
-    }
-    for (int i = 0; i < bakCount; i++) {
-        const String& bakPath = bakPaths[i];
-        // Strip ".bak" to get the canonical .json path.
-        String jsonPath = bakPath.substring(0, bakPath.length() - 4);
-        if (SD.exists(jsonPath.c_str())) {
-            SD.remove(bakPath.c_str());
-            Serial.printf("[chronicle] recovery: cleaned stale %s\n", bakPath.c_str());
-        } else {
-            if (SD.rename(bakPath.c_str(), jsonPath.c_str())) {
-                Serial.printf("[chronicle] recovery: restored %s from .bak\n", jsonPath.c_str());
-            } else {
-                logError("chronicle", "recovery: bak->json rename failed");
-            }
-        }
-    }
-}
-
-// Walk /chronicle/ and return the max date the chip has on SD as a
-// "YYYY-MM-DD" string (lexically sortable). Empty string when chip has
-// nothing. The catch-up sync sends this so the worker can push every
-// entry newer than max_date.
-//
-// Trade-off vs the previous "send all dates" protocol: gives up
-// mid-history gap detection (an entry N+1 sealed before entry N would
-// not be back-filled). In practice gaps don't happen (sealing is
-// strictly chronological), and the protocol now sends 80 bytes per
-// reconnect instead of growing 13 bytes per chronicle day, which would
-// have hit ~50 KB and OOM'd the chip past year 5.
-//
-// Layout: entries live at /chronicle/YYYY/YYYY-MM-DD.json. Any
-// pre-migration stragglers at /chronicle/YYYY-MM-DD.json are also
-// considered so a half-migrated state still reports the true max.
-//
-// O(1)-stack design: tracks the running greatest year subdir name during
-// pass 1 (no array, no cap, so chip can run for centuries without the
-// function losing precision). Pass 2 walks that year for the max date.
-// On the rare empty-year-subdir fallback (year-rollover crash mid-write),
-// re-scan root for the next-greatest year strictly less than the one we
-// just visited, and try again. Each re-scan is O(years) so the worst
-// case (every year subdir empty) is O(years²); steady state is one scan
-// + one walk = O(years + N/years).
-static String chronicleMaxDate() {
-    String maxDate = "";
-    if (!SD.exists("/chronicle")) return maxDate;
-
-    auto considerDateFile = [&](const String& base) {
-        if (base.length() != 15 || !base.endsWith(".json")) return;
-        String d = base.substring(0, 10);
-        for (int i = 0; i < 10; i++) {
-            char c = d[i];
-            if (i == 4 || i == 7) { if (c != '-') return; }
-            else if (c < '0' || c > '9') return;
-        }
-        if (d > maxDate) maxDate = d;
-    };
-
-    // Returns lex-greatest 4-digit year subdir name in /chronicle/. When
-    // `exclusiveUpper` is non-empty, the result is strictly less than it
-    // (used for the empty-year fallback). Returns "" if no match.
-    auto findMaxYear = [&](const String& exclusiveUpper) -> String {
-        String found = "";
-        File r = SD.open("/chronicle");
-        if (!r) return found;
-        if (!r.isDirectory()) { r.close(); return found; }
-        File e = r.openNextFile();
-        while (e) {
-            String name = e.name();
-            int slash = name.lastIndexOf('/');
-            String base = (slash >= 0) ? name.substring(slash + 1) : name;
-            bool isDir = e.isDirectory();
-            e.close();
-            if (isDir) {
-                bool yearOk = (base.length() == 4);
-                for (int i = 0; i < 4 && yearOk; i++) {
-                    if (base[i] < '0' || base[i] > '9') yearOk = false;
-                }
-                if (yearOk
-                    && (exclusiveUpper.length() == 0 || base < exclusiveUpper)
-                    && base > found) {
-                    found = base;
-                }
-            }
-            e = r.openNextFile();
-        }
-        r.close();
-        return found;
-    };
-
-    // Pass 1: combined root scan. Find greatest year subdir AND fold
-    // any legacy root-level files. Saves a separate scan in the common
-    // case (which is the steady-state post-migration layout).
-    File root = SD.open("/chronicle");
-    if (!root) return maxDate;
-    if (!root.isDirectory()) { root.close(); return maxDate; }
-    String currentYear = "";
-    File entry = root.openNextFile();
-    while (entry) {
-        String name = entry.name();
-        int slash = name.lastIndexOf('/');
-        String base = (slash >= 0) ? name.substring(slash + 1) : name;
-        bool isDir = entry.isDirectory();
-        entry.close();
-        if (isDir) {
-            bool yearOk = (base.length() == 4);
-            for (int i = 0; i < 4 && yearOk; i++) {
-                if (base[i] < '0' || base[i] > '9') yearOk = false;
-            }
-            if (yearOk && base > currentYear) currentYear = base;
-        } else {
-            considerDateFile(base);
-        }
-        entry = root.openNextFile();
-    }
-    root.close();
-
-    // Pass 2: walk the latest year subdir for max date. If empty (year
-    // rollover crash, manual dir creation), re-scan root for the next
-    // year less than this one and try again until something yields.
-    while (currentYear.length() > 0) {
-        String yearPath = "/chronicle/" + currentYear;
-        File yearDir = SD.open(yearPath.c_str());
-        if (yearDir) {
-            File f = yearDir.openNextFile();
-            while (f) {
-                String fname = f.name();
-                int s = fname.lastIndexOf('/');
-                String fbase = (s >= 0) ? fname.substring(s + 1) : fname;
-                f.close();
-                considerDateFile(fbase);
-                f = yearDir.openNextFile();
-            }
-            yearDir.close();
-        }
-        if (maxDate.length() > 0) break;
-        currentYear = findMaxYear(currentYear);
-    }
-    return maxDate;
-}
-
 bool connectWorker() {
     if (strlen(cfgWorkerUrl) == 0 || strlen(cfgWorkerKey) == 0) {
         Serial.println("[ws] skipped: worker_url or worker_key blank");
@@ -3940,27 +3750,6 @@ bool connectWorker() {
     wsConnected = true;
     lastWsActivity = millis();
 
-    // Catch-up sync: send the worker the max chronicle date we have on
-    // SD (or empty when we have nothing). Worker pushes every entry
-    // strictly newer than max_date via existing chronicle_seal events.
-    // Idempotent on both sides; fires every reconnect so a long offline
-    // window doesn't leave silent gaps. Payload is constant-size (~80
-    // bytes) regardless of archive depth; previous "send all dates"
-    // form would have OOM'd the chip past year 5 (~50 KB+ message).
-    String maxDate = chronicleMaxDate();
-    String syncMsg = "{\"type\":\"event\",\"event\":\"chronicle_sync_request\",\"data\":{\"max_date\":\"";
-    syncMsg += maxDate;
-    syncMsg += "\"}}";
-    wsSendText(wsClient, syncMsg);
-
-    // Re-emit retired-sensor events for any sensors already retired on SD.
-    // Covers the 1-in-a-million case where a sensor crossed the retire
-    // threshold while the WS was down: the original transition emit was
-    // lost, but the chip's SD record is correct. Worker dedups by
-    // sensor_retired/<name> key so re-emits are idempotent.
-    if (bmeHealth.retired) emitChronicleSensorRetired("BME280", bmeHealth.retired_unix);
-    if (ccsHealth.retired) emitChronicleSensorRetired("CCS811", ccsHealth.retired_unix);
-
     return true;
 }
 
@@ -3968,33 +3757,37 @@ bool connectWorker() {
 void setup() {
     Serial.begin(115200);
 
+    // Notification LED (GPIO2 onboard blue LED, active-low: LOW = on). 3 quick
+    // blinks at boot.
     pinMode(LED_PIN, OUTPUT);
-    pinMode(NOTIF_LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH);
-    digitalWrite(NOTIF_LED_PIN, HIGH);
-    delay(500);
-    digitalWrite(LED_PIN, LOW);
-    digitalWrite(NOTIF_LED_PIN, LOW);
-
-    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-        Serial.println("OLED init failed (check I2C wiring and 0x3C address)");
-        // Can't bootLog here yet (lambda defined further down, and it uses
-        // display.println which would no-op anyway on a failed display).
-        // logError persists to SD so admin can see post-reboot.
-        logError("hw", "oled init failed at 0x3C; check wiring + bus pull-ups");
-    } else {
-        oledOk = true;
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_PIN, LOW);
+        delay(120);
+        digitalWrite(LED_PIN, HIGH);
+        delay(120);
     }
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(WHITE);
 
-    display.drawBitmap(48, 2, logoBitmap, 32, 32, WHITE);
-    display.setTextSize(2);
-    display.setCursor(16, 40);
-    display.print("HelloESP");
-    display.setTextSize(1);
-    display.display();
+    // I2C bus: SDA 21 / SCL 22 (stock ESP32 pins, neither a boot-strap).
+    // 400kHz for both the OLED (1KB frame pushes) and the sensors.
+    // Wire.setTimeOut() before any sensor begin(): without it a BME-fail +
+    // CCS-success boot leaves the Wire timeout at the library default (often
+    // unbounded) so a stuck CCS read could hang the loop forever.
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(400000);
+    Wire.setTimeOut(100);
+
+    // GME12864-78 OLED (SH1106 128x64, I2C addr 0x3C). Requires Wire above.
+    display.begin();
+    oledOk = true;
+    display.clearBuffer();
+
+    // Boot splash on the 128x64 panel (1bpp logo, U8g2 fonts)
+    display.drawXBM((display.getDisplayWidth() - 32) / 2, 0, 32, 32, logoBitmap);
+    display.setFont(u8g2_font_6x13_tf);
+    display.drawStr((display.getDisplayWidth() - display.getStrWidth("HelloESP")) / 2, 44, "HelloESP");
+    display.drawStr((display.getDisplayWidth() - display.getStrWidth("esp.ecobbina.work")) / 2, 60, "esp.ecobbina.work");
+    display.sendBuffer();
     delay(1500);
 
     char bootLines[7][22] = {"", "", "", "", "", "", ""};
@@ -4005,11 +3798,11 @@ void setup() {
         }
         strncpy(bootLines[6], msg, 21);
         bootLines[6][21] = '\0';
-        display.clearDisplay();
-        display.setCursor(0, 0);
-        display.println("Loading HelloESP...");
-        for (int i = 0; i < 7; i++) display.println(bootLines[i]);
-        display.display();
+        display.clearBuffer();
+        display.setFont(u8g2_font_6x10_tf);
+        display.drawStr(0, 8, "Loading HelloESP...");
+        for (int i = 0; i < 5; i++) display.drawStr(0, 19 + i * 10, bootLines[i]);
+        display.sendBuffer();
     };
 
     // Version
@@ -4045,41 +3838,23 @@ void setup() {
     // retrying. Second attempt drops to 4MHz because if the card is
     // already marginal, higher clocks just fail again. Third attempt
     // (last chance) is the bare-minimum 1MHz startup speed.
-    bootLog("[fs] mounting sd");
-    bool sdMounted = SD.begin(SD_CS, SPI, 10000000U);
-    if (sdMounted) sdSpeedHz = 10000000U;
-    if (!sdMounted) {
-        Serial.println("[fs] sd mount failed, retrying with SPI reset @ 4MHz");
-        bootLog("[fs] sd retry 4MHz");
-        SD.end();
-        SPI.end();
-        delay(500);
-        SPI.begin();
-        sdMounted = SD.begin(SD_CS, SPI, 4000000U);
-        if (sdMounted) sdSpeedHz = 4000000U;
-    }
-    if (!sdMounted) {
-        Serial.println("[fs] sd mount failed again, last-chance retry @ 1MHz");
-        bootLog("[fs] sd retry 1MHz");
-        SD.end();
-        SPI.end();
-        delay(1000);
-        SPI.begin();
-        sdMounted = SD.begin(SD_CS, SPI, 1000000U);
-        if (sdMounted) sdSpeedHz = 1000000U;
-    }
-    if (!sdMounted) {
-        Serial.println("SD card failed or not present; auto-restarting in 60s");
-        bootLog("[fs] sd FAIL retry");
-        // Don't infinite-loop on a framed-behind-glass device: a transient
-        // SPI hiccup or brown-out is recoverable on a fresh boot. The 60s
-        // delay gives the OLED time to display the failure for an observer
-        // (and prevents a tight reboot loop if the SD is actually dead).
+    // On-chip LittleFS (no SD slot on this board). Populate the partition
+    // with `pio run -t uploadfs`; config.txt + web assets come from data/.
+    // formatOnFail=true keeps a corrupted partition from bricking the device
+    // into a boot loop — config/stats are re-uploadable.
+    bootLog("[fs] mounting littlefs");
+    bool sdMounted = SD.begin(true);
+    if (sdMounted) {
+        Serial.println("LittleFS mounted");
+        bootLog("[fs] littlefs ok");
+    } else {
+        Serial.println("LittleFS mount failed; auto-restarting in 60s");
+        bootLog("[fs] littlefs FAIL");
+        // Don't infinite-loop: a transient failure may clear on a fresh boot.
+        // The 60s delay gives the OLED time to display the failure.
         delay(60000);
         ESP.restart();
     }
-    Serial.println("SD card initialized");
-    bootLog("[fs] sd ok");
 
     // Ensure /fw/ directory exists for firmware staging (SD-flash feature).
     // Admin uploads .bin files here via the file manager; the SD-flash
@@ -4142,6 +3917,7 @@ void setup() {
                 if (key == "device_key")  val.toCharArray(cfgDeviceKey, sizeof(cfgDeviceKey));
                 if (key == "timezone")    val.toCharArray(cfgTimezone, sizeof(cfgTimezone));
                 if (key == "worker_exclusive") cfgWorkerExclusive = (val == "true");
+                if (key == "dumsor_tracking")  cfgDumsorTracking  = (val == "true");
                 if (key == "shelly_url")  val.toCharArray(cfgShellyUrl, sizeof(cfgShellyUrl));
                 if (key == "cost_per_kwh") cfgCostPerKwh = val.toFloat();
                 if (key == "co2_per_kwh")  cfgCo2PerKwh  = val.toFloat();
@@ -4161,14 +3937,9 @@ void setup() {
     }
     cachedVisitorCount = readVisitorCount();
     loadCountries();
-    // Migrate legacy flat /chronicle/YYYY-MM-DD.json paths into year subdirs
-    // before recovery + sync run, so the rest of the boot operates on the
-    // canonical layout. Idempotent + a no-op once migration has completed.
-    migrateLegacyToYearSubdir("/chronicle", "chronicle");
-    chronicleStartupRecovery();
-    // SD.usedBytes() scans the entire FAT and can take seconds on large cards;
-    // the main loop refreshes it every 5 min, so skip the boot-time hit.
-    cachedSdUsedMB = 0;
+    // LittleFS.usedBytes() is cheap on flash; the main loop refreshes it at
+    // minute 0/30, so skip the boot-time hit.
+    cachedFsUsedMB = 0;
     // Schema guard: refuse to start if the on-disk guestbook is from a
     // pre-v3 firmware. v1.4 stripped the in-firmware migrations to claw
     // back flash; users with stale SD data must flash v1.3 first to run
@@ -4231,12 +4002,18 @@ void setup() {
 
     bootLog("[hw] init sensors");
 
-    // Bound I2C reads to 100ms BEFORE any sensor begin(). Without this, a
-    // BME-fail+CCS-success boot leaves the Wire timeout at the library
-    // default (often unbounded) so a stuck CCS read could hang the loop
-    // forever. Wire.begin() runs implicitly inside the first sensor's
-    // begin(), so set the timeout up-front to cover all subsequent I2C ops.
-    Wire.setTimeOut(100);
+    // Boot-time I2C bus scan: prints every address that ACKs so wiring
+    // problems (SCL on the wrong pad, floating line) are visible on the
+    // serial monitor the moment the bus is right. Expect 0x3C (OLED),
+    // 0x76 (BME280) and 0x5A (CCS811). Wire is already up at 400kHz.
+    {
+        Serial.printf("[hw] i2c scan SDA=%d SCL=%d:", I2C_SDA, I2C_SCL);
+        for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+            Wire.beginTransmission(addr);
+            if (Wire.endTransmission() == 0) Serial.printf(" 0x%02X", addr);
+        }
+        Serial.println();
+    }
 
     // Continue boot even if a sensor fails to init. The site is the higher-value
     // workload; safeBme*/cached_* fallbacks keep serving last-known values, and
@@ -4259,43 +4036,11 @@ void setup() {
     }
     // CCS811 warmup happens in the background; runtime reads check ccs.available() each cycle
 
-    // DS3231 RTC. Pre-seeds the system clock from battery-backed time so
-    // log/sensor timestamps are correct from the first millisecond, even if
-    // NTP is slow or unreachable. NTP, when it lands, calls rtc.adjust() to
-    // re-sync the RTC against authoritative time. Apply TZ early so any
+    // No DS3231 RTC on this build: the system clock starts at epoch 0 and
+    // NTP fills it in a couple of seconds after boot. Apply TZ early so any
     // pre-NTP timestamps render in local time.
     setenv("TZ", cfgTimezone, 1);
     tzset();
-    if (!rtc.begin()) {
-        Serial.println("DS3231 init failed, continuing without RTC.");
-        bootLog("[hw] ds3231 FAIL");
-        logError("hw", "ds3231 init failed; relying on NTP only for time");
-    } else {
-        rtcOk = true;
-        if (rtc.lostPower()) {
-            // Battery dead or first power-up. RTC has no valid time; skip
-            // the pre-seed and let NTP fill it in. We'll write back to the
-            // RTC after NTP succeeds, which also clears the lostPower flag.
-            rtcLostPowerAtBoot = true;
-            bootLog("[hw] ds3231 no time");
-            logError("hw", "ds3231 lostPower flag set; CR1220 backup battery may need replacement");
-        } else {
-            DateTime n = rtc.now();
-            // Sanity: lostPower clears once NTP writes back, but a bus glitch
-            // mid-read or bit-rot in the time registers could still produce a
-            // wildly wrong year while OSF stays clear. Refuse to seed the
-            // system clock with garbage; NTP will fill in shortly.
-            if (n.year() >= 2024 && n.year() <= 2100) {
-                struct timeval tv;
-                tv.tv_sec = n.unixtime();
-                tv.tv_usec = 0;
-                settimeofday(&tv, NULL);
-                bootLog("[hw] ds3231 preseeded");
-            } else {
-                bootLog("[hw] ds3231 bad year");
-            }
-        }
-    }
 
     bootLog("[net] wifi connecting");
     WiFi.mode(WIFI_STA);
@@ -4309,11 +4054,21 @@ void setup() {
         logError("net", "WiFi SSID blank in /config.txt; halting");
         while (1) { delay(1000); }
     }
+    Serial.printf("[net] connecting to SSID '%s' (len=%u)\n", cfgSsid, strlen(cfgSsid));
     WiFi.begin(cfgSsid, cfgWifiPass);
     unsigned long wifiStart = millis();
+    int lastWifiStatus = -1;
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
-        Serial.println("Waiting for WiFi...");
+        int st = WiFi.status();
+        if (st != lastWifiStatus) {
+            lastWifiStatus = st;
+            const char* why = st == WL_NO_SSID_AVAIL ? "NO_SSID (network not found)" :
+                              st == WL_DISCONNECTED   ? "DISCONNECTED (bad password or rejected)" :
+                              st == WL_CONNECT_FAILED  ? "CONNECT_FAILED" :
+                              st == WL_IDLE_STATUS    ? "connecting..." : "unknown";
+            Serial.printf("[net] wifi status=%d %s\n", st, why);
+        }
         if (millis() - wifiStart > 300000UL) {
             bootLog("[net] wifi TIMEOUT");
             delay(500);
@@ -4354,16 +4109,15 @@ void setup() {
         if (currentMonth.started_unix == 0) currentMonth.started_unix = nowUnix;
         if (currentYear.started_unix  == 0) currentYear.started_unix  = nowUnix;
         bootLog("[net] ntp ok");
-        // Write authoritative time back to DS3231. Also clears the lostPower
-        // flag if this was a fresh-battery boot.
-        if (rtcOk) {
-            rtc.adjust(DateTime(nowUnix));
-            bootLog("[hw] ds3231 ntp sync");
-        }
     }
     // Loaded outside the NTP-success branch so a late-NTP boot doesn't
     // zero out yesterday's daily count before the first visit lands.
     loadDailyVisitors();
+
+    // Measure the last power cut (dumsor) once the clock is authoritative.
+    // No-op here when NTP is still pending; the loop's late-NTP recovery
+    // block retries it.
+    if (cfgDumsorTracking) dumsorCheckBootGap();
     // Independent of NTP: loading the persisted backup date is a pure SD read. If it were
     // inside the NTP-success branch, a late NTP sync would leave lastBackupDate empty and
     // trigger a duplicate same-day backup.
@@ -4479,26 +4233,8 @@ void setup() {
         logConsole(request, 200);
     });
 
-    server.on("/snake", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (redirectLanToWorker(request)) return;
-        AsyncWebServerResponse *r = beginResponseGzipOrRaw(request, "/snake.html", "text/html");
-        r->addHeader("Cache-Control", "public, max-age=300");
-        request->send(r);
-        logConsole(request, 200);
-    });
-
-    server.on("/chronicle", HTTP_GET, [](AsyncWebServerRequest *request) {
-        // Chronicle data lives in the Worker's DO storage (accumulated from
-        // stats_update events, sealed at UTC midnight). The chip just serves
-        // the SPA shell here; the page fetches /chronicle.json client-side.
-        // Permalinks like /chronicle/YYYY-MM-DD are rewritten worker-side to
-        // hit this same handler, so all chronicle URLs serve chronicle.html.
-        if (redirectLanToWorker(request)) return;
-        AsyncWebServerResponse *r = beginResponseGzipOrRaw(request, "/chronicle.html", "text/html");
-        r->addHeader("Cache-Control", "public, max-age=300");
-        request->send(r);
-        logConsole(request, 200);
-    });
+    // (Removed in the core-site port: /snake and /chronicle routes, pages,
+    // and their WS/admin plumbing. Snake score storage lived worker-side.)
 
     server.on("/console.json", HTTP_GET, [](AsyncWebServerRequest *request) {
         if (redirectLanToWorker(request)) return;
@@ -4576,13 +4312,8 @@ void setup() {
         {"/favicon.png", "image/png"},
         {"/favicon.svg", "image/svg+xml"},
         {"/og-banner.jpg", "image/jpeg"},
-        {"/esp32-webserver.jpg", "image/jpeg"},
-        {"/esp32-webserver-bme280.jpg", "image/jpeg"},
-        {"/esp8266-webserver.jpg", "image/jpeg"},
-        {"/helloesp-framed.jpg", "image/jpeg"},
-        {"/helloesp-framed-2026-04.jpg", "image/jpeg"},
-        {"/helloesp-boot.mp4", "video/mp4"},
-        {"/helloesp-boot-poster.jpg", "image/jpeg"}
+        {"/esp32-current.jpg", "image/jpeg"},
+        {"/esp32-location.jpg", "image/jpeg"}
     };
     for (auto& f : staticFiles) {
         server.on(f.path, HTTP_GET, [f](AsyncWebServerRequest *request) {
@@ -4614,9 +4345,9 @@ void setup() {
 
     server.on("/.well-known/security.txt", HTTP_GET, [](AsyncWebServerRequest *request) {
         AsyncWebServerResponse *r = request->beginResponse(200, "text/plain",
-            "Contact: mailto:hello@tech1k.com\n"
+            "Contact: https://github.com/EnochT14/hello-esp/issues\n"
             "Preferred-Languages: en\n"
-            "Canonical: https://helloesp.com/.well-known/security.txt\n"
+            "Canonical: https://esp.ecobbina.work/.well-known/security.txt\n"
             "Expires: 2027-04-16T00:00:00.000Z\n");
         r->addHeader("Cache-Control", "public, max-age=86400");
         request->send(r);
@@ -4625,15 +4356,16 @@ void setup() {
     server.on("/humans.txt", HTTP_GET, [](AsyncWebServerRequest *request) {
         request->send(200, "text/plain; charset=utf-8",
             "/* TEAM */\n"
-            "    Made by: Kristian Kramer (Tech1k)\n"
-            "    Site: https://tech1k.com\n"
-            "    GitHub: https://github.com/Tech1k/helloesp\n"
+            "    Made by: EnochT14\n"
+            "    Site: https://github.com/EnochT14/hello-esp\n"
+            "    GitHub: https://github.com/EnochT14/hello-esp\n"
             "\n"
             "/* DEVICE */\n"
-            "    MCU: Espressif ESP32 DOIT DevKit V1, 520 KB RAM\n"
+            "    MCU: Espressif ESP32 WROOM-32 dev board, 520 KB RAM\n"
             "    Sensors: Bosch BME280, AMS CCS811\n"
-            "    Display: SSD1306 128x64 OLED\n"
-            "    Storage: 32 GB FAT32 SD card\n"
+            "    Display: GME12864-78 OLED (SH1106 128x64, I2C)\n"
+            "    Input: none (auto-rotating pages)\n"
+            "    Storage: on-chip 1.9 MB LittleFS (4 MB flash)\n"
             "    Relay: Cloudflare Worker (WebSocket + Durable Object)\n"
             "\n"
             "/* SITE */\n"
@@ -4662,26 +4394,21 @@ void setup() {
             "Disallow: /console.json\n"
             "Disallow: /history.json\n"
             "Disallow: /records.json\n"
-            "Disallow: /snake/seed\n"
-            "Disallow: /snake/score\n"
             "\n"
-            "Sitemap: https://helloesp.com/sitemap.xml\n");
+            "Sitemap: https://esp.ecobbina.work/sitemap.xml\n");
     });
 
     server.on("/sitemap.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
         AsyncWebServerResponse *r = request->beginResponse(200, "application/xml",
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
-            "  <url><loc>https://helloesp.com/</loc><changefreq>daily</changefreq><priority>1.0</priority></url>\n"
-            "  <url><loc>https://helloesp.com/guestbook</loc><changefreq>daily</changefreq><priority>0.8</priority></url>\n"
-            "  <url><loc>https://helloesp.com/history</loc><changefreq>weekly</changefreq><priority>0.6</priority></url>\n"
-            "  <url><loc>https://helloesp.com/console</loc><changefreq>always</changefreq><priority>0.5</priority></url>\n"
-            "  <url><loc>https://helloesp.com/about</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>\n"
-            "  <url><loc>https://helloesp.com/snake</loc><changefreq>weekly</changefreq><priority>0.5</priority></url>\n"
-            "  <url><loc>https://helloesp.com/chronicle</loc><changefreq>daily</changefreq><priority>0.7</priority></url>\n"
-            "  <url><loc>https://helloesp.com/chronicle.rss</loc><changefreq>daily</changefreq><priority>0.4</priority></url>\n"
-            "  <url><loc>https://helloesp.com/changelog.rss</loc><changefreq>monthly</changefreq><priority>0.4</priority></url>\n"
-            "  <url><loc>https://helloesp.com/guestbook.rss</loc><changefreq>daily</changefreq><priority>0.4</priority></url>\n"
+            "  <url><loc>https://esp.ecobbina.work/</loc><changefreq>daily</changefreq><priority>1.0</priority></url>\n"
+            "  <url><loc>https://esp.ecobbina.work/guestbook</loc><changefreq>daily</changefreq><priority>0.8</priority></url>\n"
+            "  <url><loc>https://esp.ecobbina.work/history</loc><changefreq>weekly</changefreq><priority>0.6</priority></url>\n"
+            "  <url><loc>https://esp.ecobbina.work/console</loc><changefreq>always</changefreq><priority>0.5</priority></url>\n"
+            "  <url><loc>https://esp.ecobbina.work/about</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>\n"
+            "  <url><loc>https://esp.ecobbina.work/changelog.rss</loc><changefreq>monthly</changefreq><priority>0.4</priority></url>\n"
+            "  <url><loc>https://esp.ecobbina.work/guestbook.rss</loc><changefreq>daily</changefreq><priority>0.4</priority></url>\n"
             "</urlset>\n");
         r->addHeader("Cache-Control", "public, max-age=86400");
         request->send(r);
@@ -4694,13 +4421,13 @@ void setup() {
         rss = F("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                 "<rss version=\"2.0\"><channel>"
                 "<title>HelloESP | Changelog</title>"
-                "<link>https://helloesp.com/</link>"
+                "<link>https://esp.ecobbina.work/</link>"
                 "<description>Updates to the HelloESP project.</description>"
                 "<language>en</language>");
         auto item = [&](const char* date, const char* pubDate, const char* text) {
             rss += "<item><title>";
             rss += date;
-            rss += "</title><link>https://helloesp.com/</link><guid isPermaLink=\"false\">helloesp-";
+            rss += "</title><link>https://esp.ecobbina.work/</link><guid isPermaLink=\"false\">helloesp-";
             rss += pubDate;
             rss += "</guid><pubDate>";
             rss += pubDate;
@@ -4708,28 +4435,10 @@ void setup() {
             rss += text;
             rss += "</description></item>";
         };
-        item("May 10, 2026", "Sun, 10 May 2026 12:00:00 GMT",
-             "Refreshed the photo carousel. The current framed shot now shows the device with the DS3231 and nameplate added over the past couple weeks, with the April 19 mounting-day shot kept as the second slide. New boot video too: sharper, tighter cut, no audio track. Hero image on the GitHub repo got the same treatment.");
-        item("May 8, 2026", "Fri, 08 May 2026 12:00:00 GMT",
-             "/chronicle got a few quality-of-life updates. Today's in-progress entry shows above the archive, refreshing as the chip writes more of the day. Filter chips slice the archive to just milestones, records, anomalies, busy days, or quiet days. Each entry has a share button, and arrow keys step between days on entry pages. Guestbook translation got smarter too: better source-language detection so casual English no longer trips the translate button, and previously-untranslatable diacritic-less Czech, Polish, and Italian now translate correctly.");
-        item("May 6, 2026", "Wed, 06 May 2026 12:00:00 GMT",
-             "Chronicle entries now align to the chip's local timezone instead of UTC, so each day's entry covers the chip's actual day from where it's running. The chip also notices when one of its sensors stops working, retires it, and writes a chronicle entry about the loss. Behind the scenes, archive folders moved to a year-grouped layout so the chip can run for decades without slowing down. Firmware 1.4 also drops the boot-time CSV migrations to free flash for future features; pre-1.3 installs need to flash 1.3 first.");
-        item("May 4, 2026", "Mon, 04 May 2026 12:00:00 GMT",
-             "Added /chronicle: a daily entry the chip writes about itself. Auto-generated from sensor readings, visitors, and weather, archived from today onward. Each midnight the day's snapshot freezes into a permanent entry. Five starter templates pick the right shape for the day (busy, quiet, anomaly, milestone, generic), and there's a permalink for every entry.");
-        item("May 3, 2026", "Sun, 03 May 2026 12:00:00 GMT",
-             "Snake got its own page. Same game, with two leaderboards now: today's top scores and the all-time top ten. Strong scores cross to all-time on their own. Each top entry has a watch button that plays back the actual game. Past quarters move to a Hall of Fame archive so the leaderboard stays fresh.");
-        item("May 1, 2026", "Fri, 01 May 2026 12:00:00 GMT",
-             "The site can now track its own electricity use with an optional smart plug. The homepage shows live wattage and lifetime energy, plus cost and CO2 if you set your grid rate. Outdoor weather card grew with air quality, UV index, atmospheric CO2, dewpoint, and pressure trend, and the icons now match the time of day.");
-        item("Apr 29, 2026", "Wed, 29 Apr 2026 12:00:00 GMT",
-             "Added a DS3231 real-time clock module on the breadboard. Boot logs and timestamps are correct right away instead of being wrong for a few seconds until NTP syncs. History page got a year-grouped collapsible layout that stays readable as archives pile up over time. New /about page with the short version of the project story for casual visitors.");
-        item("Apr 27, 2026", "Mon, 27 Apr 2026 12:00:00 GMT",
-             "Snake now has a global leaderboard. Top 10 with 3-letter initials, shared across the 404, offline, and timeout pages. Anti-cheat is server-side: the worker hands out a seed at game start, you submit your move log on game over, and the worker replays it to confirm the score. Only way onto the board is actually playing.");
-        item("Apr 19, 2026", "Sun, 19 Apr 2026 12:00:00 GMT",
-             "Public relaunch on a fresh ESP32. Full rebuild: air quality sensors, historical charts, guestbook with moderation, admin panel, OLED dashboard, daily off-site backups, and a Cloudflare Worker relay so it can live on WiFi without a tunnel.");
-        // Older RSS entries (Apr 21-26, plus the 2022-2023 history) were
-        // dropped to fit OTA. The same content is in the changelog section on
-        // the homepage behind "show older", and the project's pre-relaunch
-        // history lives in /about and the README.
+        item("Aug 4, 2026", "Tue, 04 Aug 2026 13:00:00 GMT",
+             "Tried moving the project to a T-Display Keyboard board. Its GPIO 21/22 are wired to the keyboard rows, so the stock ESP32 I2C pins aren't free. Workaround: I2C now runs on configurable pins (I2C_SDA/I2C_SCL) and the bus-recovery routine manually clocks the configured SCL pin instead of Arduino's default SDA/SCL macros, so it can't drive the keyboard rows.");
+        item("Aug 4, 2026", "Tue, 04 Aug 2026 12:00:00 GMT",
+             "This project was forked from HelloESP by Tech1k (https://github.com/Tech1k/helloesp) on 4th August. All credit for the original project goes to them.");
         rss += "</channel></rss>";
         AsyncWebServerResponse *r = request->beginResponse(200, "application/rss+xml", rss);
         r->addHeader("Cache-Control", "public, max-age=86400");
@@ -5835,7 +5544,7 @@ void setup() {
             rss = F("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                     "<rss version=\"2.0\"><channel>"
                     "<title>HelloESP | Guestbook</title>"
-                    "<link>https://helloesp.com/guestbook</link>"
+                    "<link>https://esp.ecobbina.work/guestbook</link>"
                     "<description>Approved guestbook entries from HelloESP.</description>"
                     "<language>en</language>");
 
@@ -5896,7 +5605,7 @@ void setup() {
                         rss += "<item><title>";
                         rss += name;
                         if (country.length() > 0 && country != "??") { rss += " ("; rss += country; rss += ")"; }
-                        rss += "</title><link>https://helloesp.com/guestbook#";
+                        rss += "</title><link>https://esp.ecobbina.work/guestbook#";
                         rss += entryId;
                         rss += "</link>";
                         rss += "<guid isPermaLink=\"false\">gb-";
@@ -5922,6 +5631,16 @@ void setup() {
             if (isRateLimited(clientIpString(request))) {
                 request->send(429, "text/plain", "Please wait before posting again");
                 return;
+            }
+            // No RTC on this build: refuse to timestamp entries until NTP has
+            // synced so guestbook.csv never contains pre-boot or 1970 dates.
+            // The window is only a few seconds after power-on.
+            {
+                struct tm tGate;
+                if (!getLocalTime(&tGate, 0)) {
+                    request->send(503, "text/plain", "Clock not synced yet, try again in a moment");
+                    return;
+                }
             }
             if (pendingGuestbook >= MAX_PENDING_GUESTBOOK) {
                 AsyncWebServerResponse *r = request->beginResponse(429, "text/plain",
@@ -6720,12 +6439,12 @@ void setup() {
             };
 
             // 1. BME280
-            float tf = safeBmeTemp() * 9.0f / 5.0f + 32.0f;
+            float tc = safeBmeTemp();
             float hm = safeBmeHumidity();
             float pr = safeBmePressureHpa();
-            bool bmeOk = !isnan(tf) && !isnan(hm) && !isnan(pr) && !bmeDegraded();
+            bool bmeOk = !isnan(tc) && !isnan(hm) && !isnan(pr) && !bmeDegraded();
             addTest("BME280", bmeOk ? "pass" : "fail",
-                bmeOk ? (String(tf, 1) + "F, " + String(hm, 0) + "% RH, " + String(pr, 1) + " hPa")
+                bmeOk ? (String(tc, 1) + "C, " + String(hm, 0) + "% RH, " + String(pr, 1) + " hPa")
                       : "sensor not responding or returning NaN");
 
             // 2. CCS811
@@ -6734,23 +6453,16 @@ void setup() {
                 ccsOk ? (String(cached_co2) + " ppm eCO2, " + String(cached_voc) + " ppb VOC")
                       : "sensor stale; CCS811 warms up over first 20 minutes");
 
-            // 2b. OLED. Write-only display, so liveness is "did init succeed
-            // at boot AND does the chip still ACK on the bus." Catches "wire
-            // came loose" / "chip died" but NOT "displaying garbage" (which
-            // requires eyeballs since SSD1306 has no readback path).
-            if (!oledOk) {
-                addTest("OLED", "fail", "init failed at boot; check wiring at 0x3C");
-            } else {
-                Wire.beginTransmission(0x3C);
-                bool live = (Wire.endTransmission() == 0);
-                addTest("OLED", live ? "pass" : "fail",
-                    live ? "responding at 0x3C"
-                         : "init ok at boot but no longer responding (wire loose? bus hang?)");
-            }
+            // 2b. OLED. SH1106 128x64 on the I2C bus; liveness is "init
+            // succeeded at boot". (The bus-ACK probe for 0x3C is folded into
+            // the I2C scan at boot.)
+            addTest("OLED", oledOk ? "pass" : "fail",
+                oledOk ? "SH1106 128x64 initialized"
+                       : "init failed at boot; check I2C wiring + pullups");
 
-            // 3. SD write/read cycle
+            // 3. Flash filesystem write/read cycle (LittleFS, on-chip)
             bool sdOk = false;
-            String sdDetail = "SD test failed";
+            String sdDetail = "LittleFS test failed";
             {
                 const char* testPath = "/_selftest.tmp";
                 uint32_t token = (uint32_t)millis();
@@ -6769,25 +6481,15 @@ void setup() {
                         // fail. strtoul handles the full uint32_t range.
                         if ((uint32_t)strtoul(line.c_str(), nullptr, 10) == token) {
                             sdOk = true;
-                            // Capacity reported in MB to avoid overflow on large cards (uint64 → uint32 cast)
-                            uint32_t cardMb = (uint32_t)(SD.cardSize() / (1024ULL * 1024ULL));
-                            const char* cardKind;
-                            switch (SD.cardType()) {
-                                case CARD_MMC:  cardKind = "MMC";   break;
-                                case CARD_SD:   cardKind = "SDSC";  break;
-                                case CARD_SDHC: cardKind = "SDHC";  break;
-                                default:        cardKind = "?";     break;
-                            }
-                            sdDetail = "write+read+delete OK; " +
-                                       String(sdSpeedHz / 1000000U) + " MHz SPI, " +
-                                       String(cardMb) + " MB " + cardKind;
+                            uint32_t fsMb = (uint32_t)(SD.totalBytes() / (1024ULL * 1024ULL));
+                            sdDetail = "write+read+delete OK; " + String(fsMb) + " MB LittleFS";
                         }
                         else sdDetail = "readback mismatch";
                     } else sdDetail = "read failed";
                     SD.remove(testPath);
                 } else sdDetail = "write failed";
             }
-            addTest("SD card", sdOk ? "pass" : "fail", sdDetail);
+            addTest("Storage", sdOk ? "pass" : "fail", sdDetail);
 
             // 4. Worker link
             if (strlen(cfgWorkerUrl) == 0) {
@@ -6830,35 +6532,6 @@ void setup() {
                 addTest("NTP", "pass", "synced (" + getTimestamp() + ")");
             } else {
                 addTest("NTP", "warn", "not yet synced; background daemon retrying");
-            }
-
-            // 5b. DS3231 RTC
-            if (!rtcOk) {
-                addTest("DS3231 RTC", "warn", "not detected at boot; running on NTP only");
-            } else if (rtcLostPowerAtBoot) {
-                // Latched at boot so this stays visible after NTP clears the live flag.
-                // CR1220 needs replacement; until then NTP fills the gap each boot.
-                DateTime r = rtc.now();
-                float rtcTempC = rtc.getTemperature();
-                String detail = "lostPower at boot (CR1220 likely depleted); " +
-                                String(r.year()) + "-" +
-                                (r.month() < 10 ? "0" : "") + String(r.month()) + "-" +
-                                (r.day() < 10 ? "0" : "") + String(r.day()) + " " +
-                                (r.hour() < 10 ? "0" : "") + String(r.hour()) + ":" +
-                                (r.minute() < 10 ? "0" : "") + String(r.minute()) + " UTC, " +
-                                String(rtcTempC, 1) + "C internal";
-                addTest("DS3231 RTC", "warn", detail);
-            } else {
-                DateTime r = rtc.now();
-                float rtcTempC = rtc.getTemperature();
-                String detail = String(r.year()) + "-" +
-                                (r.month() < 10 ? "0" : "") + String(r.month()) + "-" +
-                                (r.day() < 10 ? "0" : "") + String(r.day()) + " " +
-                                (r.hour() < 10 ? "0" : "") + String(r.hour()) + ":" +
-                                (r.minute() < 10 ? "0" : "") + String(r.minute()) + ":" +
-                                (r.second() < 10 ? "0" : "") + String(r.second()) + " UTC, " +
-                                String(rtcTempC, 1) + "C internal";
-                addTest("DS3231 RTC", "pass", detail);
             }
 
             // 6. Free heap
@@ -6906,13 +6579,10 @@ void setup() {
             if (!adminAuth(request)) return;
             auto nameForAddr = [](uint8_t a) -> const char* {
                 switch (a) {
-                    case 0x3C: return "OLED (SSD1306)";
-                    case 0x3D: return "OLED (SSD1306, alt)";
                     case 0x40: return "INA219";
                     case 0x57: return "AT24C32 EEPROM (often bundled with DS3231)";
                     case 0x5A: return "CCS811";
                     case 0x5B: return "CCS811 (alt)";
-                    case 0x68: return "DS3231 RTC";
                     case 0x76: return "BME280";
                     case 0x77: return "BME280 (alt) / BMP180";
                     default:   return "unknown";
@@ -7413,75 +7083,8 @@ void setup() {
             return;
         }
 
-        if (url == "/admin/snake-clear" && request->method() == HTTP_POST) {
-            if (!adminAuth(request)) return;
-            if (!wsConnected || !wsClient.connected()) {
-                request->send(503, "text/plain", "Worker link offline");
-                return;
-            }
-            pendingSnakeClearFlag = true;
-            request->send(200, "text/plain", "Triggered - poll /admin/snake-clear-result for outcome");
-            return;
-        }
-
-        if (url == "/admin/snake-clear-result" && request->method() == HTTP_GET) {
-            if (!adminAuth(request)) return;
-            time_t now = time(nullptr);
-            long ageSecs = snakeClearAtUnix ? (long)(now - (time_t)snakeClearAtUnix) : -1;
-            String json = "{";
-            json += "\"at_unix\":" + String(snakeClearAtUnix) + ",";
-            json += "\"age_s\":" + String(ageSecs) + ",";
-            json += "\"ok\":" + String(snakeClearOk ? "true" : "false");
-            json += "}";
-            AsyncWebServerResponse *r = request->beginResponse(200, "application/json", json);
-            r->addHeader("Cache-Control", "no-store");
-            request->send(r);
-            return;
-        }
-
-        if (url == "/admin/chronicle/note" && request->method() == HTTP_POST) {
-            // Owner curatorial note for a Chronicle entry. Body is form-
-            // encoded with `date=YYYY-MM-DD&note=...`. The chip just
-            // validates and forwards via the authenticated WS event channel
-            // to the worker DO, which holds the actual entry storage.
-            // Empty note clears any existing note for that date.
-            if (!adminAuth(request)) return;
-            if (!request->hasParam("date", true)) {
-                request->send(400, "text/plain", "date required");
-                return;
-            }
-            String date = request->getParam("date", true)->value();
-            // Strict YYYY-MM-DD validation. Length+dash-position alone would
-            // accept things like `1234-56-7"` which would break the JSON
-            // sent to the worker. Require digits in the other 8 positions.
-            bool dateOk = date.length() == 10
-                       && date.charAt(4) == '-' && date.charAt(7) == '-';
-            for (int i = 0; dateOk && i < 10; i++) {
-                if (i == 4 || i == 7) continue;
-                char c = date.charAt(i);
-                if (c < '0' || c > '9') dateOk = false;
-            }
-            if (!dateOk) {
-                request->send(400, "text/plain", "date must be YYYY-MM-DD");
-                return;
-            }
-            String note = "";
-            if (request->hasParam("note", true)) {
-                note = request->getParam("note", true)->value();
-                if (note.length() > 1000) note = note.substring(0, 1000);
-            }
-            if (!wsConnected || !wsClient.connected()) {
-                request->send(503, "text/plain", "Worker link offline");
-                return;
-            }
-            String msg = "{\"type\":\"event\",\"event\":\"chronicle_note_set\",\"data\":{";
-            msg += "\"date\":\"" + date + "\",";
-            msg += "\"note\":\"" + jsonEscape(note) + "\"";
-            msg += "}}";
-            wsSendText(wsClient, msg);
-            request->send(200, "text/plain", "ok");
-            return;
-        }
+        // (Removed in the core-site port: /admin/snake-clear, /admin/snake-
+        // clear-result, and /admin/chronicle/note. Snake + chronicle are gone.)
 
         if (url == "/admin/r2-healthcheck" && request->method() == HTTP_POST) {
             if (!adminAuth(request)) return;
@@ -7853,18 +7456,20 @@ static void tryI2cRecovery() {
     logError("i2c", "bus reset: both BME280 and CCS811 stale >2min");
 
     Wire.end();
-    pinMode(SCL, OUTPUT);
-    pinMode(SDA, INPUT_PULLUP);
+    // NOTE: use the configured I2C pins, not Arduino's default SCL/SDA
+    // macros (GPIO 21/22 are keyboard rows on the T-Display Keyboard).
+    pinMode(I2C_SCL, OUTPUT);
+    pinMode(I2C_SDA, INPUT_PULLUP);
     for (int i = 0; i < 9; i++) {
-        digitalWrite(SCL, HIGH); delayMicroseconds(5);
-        digitalWrite(SCL, LOW);  delayMicroseconds(5);
+        digitalWrite(I2C_SCL, HIGH); delayMicroseconds(5);
+        digitalWrite(I2C_SCL, LOW);  delayMicroseconds(5);
     }
-    digitalWrite(SCL, HIGH);
-    pinMode(SDA, OUTPUT);
-    digitalWrite(SDA, LOW);  delayMicroseconds(5);
-    digitalWrite(SDA, HIGH); delayMicroseconds(5);
+    digitalWrite(I2C_SCL, HIGH);
+    pinMode(I2C_SDA, OUTPUT);
+    digitalWrite(I2C_SDA, LOW);  delayMicroseconds(5);
+    digitalWrite(I2C_SDA, HIGH); delayMicroseconds(5);
 
-    Wire.begin();
+    Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setTimeOut(100);
     bme.begin(0x76);
     ccs.begin();
@@ -7873,6 +7478,172 @@ static void tryI2cRecovery() {
     // to produce a fresh read before we'd consider another reset.
     lastBmeGoodAt = now;
     lastCcsGoodAt = now;
+}
+
+// Format a duration (seconds) as "Xd Yh" / "Yh Zm" / "Zm Zs".
+static void formatDuration(unsigned long secs, char* out, size_t outLen) {
+    unsigned long d = secs / 86400, h = (secs % 86400) / 3600;
+    unsigned long m = (secs % 3600) / 60, s = secs % 60;
+    if (d > 0)      snprintf(out, outLen, "%lud %luh", d, h);
+    else if (h > 0) snprintf(out, outLen, "%luh %lum", h, m);
+    else if (m > 0) snprintf(out, outLen, "%lum %lus", m, s);
+    else            snprintf(out, outLen, "%lus", s);
+}
+
+// OLED pages (GME12864-78, SH1106 128x64, I2C). No keypad on this board:
+// pages auto-rotate every PAGE_INTERVAL ms. Layouts are tuned to the 128x64
+// panel (6x10/6x13 row fonts, logisoso for the big numbers).
+static void renderDisplayPage() {
+    // Throttle full redraws: a 1KB buffer over 400kHz I2C takes ~20ms per
+    // send, so once per second (or on page change) keeps the bus free for
+    // the sensors. No page shows sub-second data, so 1Hz is plenty.
+    static unsigned long lastRenderMs = 0;
+    static int lastRenderedPage = -1;
+    bool pageChanged = (displayPage != lastRenderedPage);
+    if (!pageChanged && millis() - lastRenderMs < RENDER_INTERVAL_MS) return;
+    lastRenderedPage = displayPage;
+    lastRenderMs = millis();
+
+    display.clearBuffer();
+    const int w = display.getDisplayWidth();
+
+    auto centerText = [&](const char* s, int y, const uint8_t* font) {
+        display.setFont(font);
+        display.drawStr((w - display.getStrWidth(s)) / 2, y, s);
+    };
+    auto rowText = [&](const char* label, const char* value, int y) {
+        display.setFont(u8g2_font_6x10_tf);
+        display.drawStr(0, y, label);
+        display.drawStr(w - display.getStrWidth(value), y, value);
+    };
+
+    switch (displayPage) {
+        case 0: { // clock
+            struct tm t;
+            if (getLocalTime(&t)) {
+                char timeBuf[8], dateBuf[20];
+                strftime(timeBuf, sizeof(timeBuf), "%H:%M", &t);
+                strftime(dateBuf, sizeof(dateBuf), "%a %d %b %Y", &t);
+                centerText(timeBuf, 34, u8g2_font_logisoso32_tf);
+                centerText(dateBuf, 48, u8g2_font_6x13_tf);
+                char line[24];
+                unsigned long secs = millis() / 1000;
+                if (bootTime > 0 && getLocalTime(&t)) {
+                    time_t nowEpoch = mktime(&t);
+                    if (nowEpoch > bootTime) secs = (unsigned long)(nowEpoch - bootTime);
+                }
+                int d = secs / 86400, hh = (secs % 86400) / 3600;
+                snprintf(line, sizeof(line), "Up %dd %dh  R: %d", d, hh, requestsThisInterval);
+                centerText(line, 62, u8g2_font_6x13_tf);
+            } else {
+                centerText("No time sync yet", 40, u8g2_font_6x13_tf);
+            }
+            break;
+        }
+        case 1: { // environment
+            float tc = safeBmeTemp();
+            float hu = safeBmeHumidity();
+            (void)safeBmePressureHpa();
+            bool bmeBad = bmeDegraded();
+            char v[20];
+            snprintf(v, sizeof(v), "%.1f C", tc);
+            rowText(bmeBad ? "Temp !" : "Temp", v, 10);
+            snprintf(v, sizeof(v), "%.0f %%", hu);
+            rowText(bmeBad ? "Hum !" : "Humidity", v, 22);
+            snprintf(v, sizeof(v), "%.0f hPa", cached_pressure_hpa);
+            rowText("Pressure", v, 34);
+            float hi = calcHeatIndex(tc * 9.0f / 5.0f + 32.0f, hu);
+            snprintf(v, sizeof(v), "%.1f C", (hi - 32.0f) * 5.0f / 9.0f);
+            rowText("Heat idx", v, 46);
+            char line[32];
+            snprintf(line, sizeof(line), "Alt %.0f ft", safeBmeAltitudeFt());
+            centerText(line, 62, u8g2_font_6x10_tf);
+            break;
+        }
+        case 2: { // air quality
+            bool ccsBad = ccsDegraded();
+            char v[16];
+            if (ccsBad) snprintf(v, sizeof(v), "--");
+            else        snprintf(v, sizeof(v), "%d", (int)cached_co2);
+            centerText("eCO2 (ppm)", 8, u8g2_font_6x10_tf);
+            centerText(v, 34, u8g2_font_logisoso28_tf);
+            int barW = w - 24, barX = 12;
+            int fill = barW;
+            if (cached_co2 >= 400 && !ccsBad) {
+                fill = (int)(barW * ((cached_co2 - 400) / 1600.0f));
+                if (fill < 0) fill = 0;
+                if (fill > barW) fill = barW;
+            }
+            display.drawFrame(barX, 37, barW, 4);
+            if (!ccsBad) display.drawBox(barX, 37, fill, 4);
+            char line[32];
+            if (cached_co2 >= 1000) snprintf(line, sizeof(line), "Open a window!");
+            else if (cached_co2 >= 800) snprintf(line, sizeof(line), "Getting stuffy...");
+            else snprintf(line, sizeof(line), "Air is fine");
+            centerText(line, 51, u8g2_font_6x10_tf);
+            snprintf(line, sizeof(line), "VOC %d ppb %s", (int)cached_voc, ccsBad ? "!" : "");
+            centerText(line, 62, u8g2_font_6x10_tf);
+            break;
+        }
+        case 3: { // stats
+            char line[24];
+            IPAddress ip = WiFi.localIP();
+            snprintf(line, sizeof(line), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+            rowText("IP", line, 10);
+            snprintf(line, sizeof(line), "%d", cachedVisitorCount);
+            rowText("Visitors", line, 22);
+            snprintf(line, sizeof(line), "%d", dailyVisitors);
+            rowText("Today", line, 34);
+            snprintf(line, sizeof(line), "%d dBm", WiFi.RSSI());
+            rowText("RSSI", line, 46);
+            snprintf(line, sizeof(line), "%dK", ESP.getFreeHeap() / 1024);
+            rowText("Heap", line, 58);
+            break;
+        }
+        case 4: { // guestbook
+            char v[16];
+            snprintf(v, sizeof(v), "%d", pendingGuestbook);
+            centerText("Guestbook pending", 8, u8g2_font_6x10_tf);
+            centerText(v, 36, u8g2_font_logisoso28_tf);
+            char line[32];
+            snprintf(line, sizeof(line), "Total entries: %d", gbCountAll);
+            centerText(line, 50, u8g2_font_6x10_tf);
+            centerText("LED on while pending", 62, u8g2_font_6x10_tf);
+            break;
+        }
+        case 5: { // dumsor power tracking
+            centerText("Last power cut", 8, u8g2_font_6x10_tf);
+            if (!cfgDumsorTracking) {
+                centerText("tracking off", 36, u8g2_font_6x13_tf);
+                break;
+            }
+            char v[24];
+            if (dumsorLastOutageSecs > 0) {
+                formatDuration(dumsorLastOutageSecs, v, sizeof(v));
+                centerText(v, 36, u8g2_font_logisoso28_tf);
+                struct tm at;
+                if (dumsorLastOutageAt > 0 && localtime_r(&dumsorLastOutageAt, &at)) {
+                    char when[32];
+                    strftime(when, sizeof(when), "%d %b %H:%M", &at);
+                    char line[40];
+                    snprintf(line, sizeof(line), "restored %s", when);
+                    centerText(line, 50, u8g2_font_6x10_tf);
+                }
+            } else {
+                centerText("none recorded", 36, u8g2_font_6x13_tf);
+            }
+            char line[40];
+            snprintf(line, sizeof(line), "Month %u  Total %u", dumsorOutagesMonth, dumsorOutagesTotal);
+            centerText(line, 62, u8g2_font_6x10_tf);
+            break;
+        }
+        case 6: { // QR
+            display.drawXBM((w - 50) / 2, 0, 50, 50, qrBitmap);
+            centerText("esp.ecobbina.work", 62, u8g2_font_6x10_tf);
+            break;
+        }
+    }
+    display.sendBuffer();
 }
 
 // Main loop
@@ -7911,8 +7682,9 @@ void loop() {
             if (currentMonth.started_unix == 0) currentMonth.started_unix = nowUnix;
             if (currentYear.started_unix  == 0) currentYear.started_unix  = nowUnix;
             Serial.println("[ntp] late-sync recovered; bootTime + period starts stamped");
-            // Trust NTP over RTC: write current authoritative time back to RTC.
-            if (rtcOk) rtc.adjust(DateTime(nowUnix));
+            // First chance the clock was authoritative this boot: measure the
+            // dumsor gap against the persisted proof-of-life.
+            if (cfgDumsorTracking) dumsorCheckBootGap();
         }
     }
 
@@ -7920,6 +7692,15 @@ void loop() {
     // SD rewrite). Critical under flash-crowd traffic where per-visit SD
     // writes would saturate the bus and starve AsyncTCP.
     maybeFlushCountries();
+
+    // Dumsor proof-of-life: persist the current epoch every 5 min so the next
+    // boot can measure how long the grid was down. Gated on bootTime so we
+    // never store a pre-NTP (1970-era) timestamp.
+    if (cfgDumsorTracking && bootTime > 0 && millis() - lastLastSeenWrite >= LASTSEEN_INTERVAL_MS) {
+        lastLastSeenWrite = millis();
+        struct tm tLs;
+        if (getLocalTime(&tLs, 0)) dumsorWriteLastSeen(mktime(&tLs));
+    }
 
     // While an upload is streaming (and for a grace window after the last
     // chunk), AsyncTCP owns the SD bus. WS writes can block ~10s under that
@@ -7970,135 +7751,13 @@ void loop() {
         wifiDownSince = 0;
     }
 
-    // OLED pages
+    // Display page auto-rotation (no keypad on this board)
     if (millis() - lastPageSwitch >= PAGE_INTERVAL) {
         displayPage = (displayPage + 1) % DISPLAY_PAGES;
         lastPageSwitch = millis();
     }
 
-    // 1px horizontal shift per page for OLED burn-in protection
-    int shiftX = displayPage % 2;
-
-    display.clearDisplay();
-
-    switch (displayPage) {
-        case 0: {
-            display.setTextSize(1);
-            char line[22];
-            IPAddress ip = WiFi.localIP();
-            snprintf(line, sizeof(line), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-            display.setCursor(shiftX, 4);
-            display.print(line);
-            struct tm now;
-            unsigned long secs = millis() / 1000;
-            if (bootTime > 0 && getLocalTime(&now)) {
-                time_t nowEpoch = mktime(&now);
-                // Guard against backward time-steps (NTP slew, RTC step):
-                // unsigned subtraction would wrap to ~136 years and the OLED
-                // would print "Uptime: 49710d 14h" until the page rotates.
-                if (nowEpoch > bootTime) secs = (unsigned long)(nowEpoch - bootTime);
-            }
-            int d = secs / 86400; int h = (secs % 86400) / 3600;
-            snprintf(line, sizeof(line), "Uptime: %dd %dh", d, h);
-            display.setCursor(shiftX, 18);
-            display.print(line);
-            snprintf(line, sizeof(line), "Visitors: %d", cachedVisitorCount);
-            display.setCursor(shiftX, 32);
-            display.print(line);
-            snprintf(line, sizeof(line), "Today: %d", dailyVisitors);
-            display.setCursor(shiftX, 46);
-            display.print(line);
-            break;
-        }
-        case 1: {
-            float tf = safeBmeTemp() * 9.0f / 5.0f + 32.0f;
-            float hu = safeBmeHumidity();
-            // Refresh cached pressure for its side effect (lastBmeGoodAt
-            // bump + cached_pressure_hpa update); altitude derives from it.
-            (void)safeBmePressureHpa();
-            bool bmeBad = bmeDegraded();
-            bool ccsBad = ccsDegraded();
-            display.setTextSize(1);
-            char line[24];
-            snprintf(line, sizeof(line), "%sTemp: %.1f F", bmeBad ? "!" : "", tf);
-            display.setCursor(shiftX, 4);
-            display.print(line);
-            snprintf(line, sizeof(line), "%sHumidity: %.0f%%", bmeBad ? "!" : "", hu);
-            display.setCursor(shiftX, 18);
-            display.print(line);
-            // Displayed as "eCO2" because the CCS811 is a MOX sensor that estimates CO2 from VOC levels.
-            snprintf(line, sizeof(line), "%seCO2: %d ppm", ccsBad ? "!" : "", cached_co2);
-            display.setCursor(shiftX, 32);
-            display.print(line);
-            snprintf(line, sizeof(line), "%sVOC: %d ppb", ccsBad ? "!" : "", cached_voc);
-            display.setCursor(shiftX, 46);
-            display.print(line);
-            break;
-        }
-        case 2: {
-            display.setTextSize(1);
-            char line[22];
-            snprintf(line, sizeof(line), "RSSI: %d dBm", WiFi.RSSI());
-            display.setCursor(shiftX, 4);
-            display.print(line);
-            snprintf(line, sizeof(line), "Requests: %d", requestsThisInterval);
-            display.setCursor(shiftX, 18);
-            display.print(line);
-            snprintf(line, sizeof(line), "CPU Temp: %.1f C", temperatureRead());
-            display.setCursor(shiftX, 32);
-            display.print(line);
-            snprintf(line, sizeof(line), "Free Heap: %dK", ESP.getFreeHeap() / 1024);
-            display.setCursor(shiftX, 46);
-            display.print(line);
-            break;
-        }
-        case 3: {
-            display.drawBitmap(48 + shiftX, 2, logoBitmap, 32, 32, WHITE);
-            display.setTextSize(1);
-            display.setCursor(40 + shiftX, 38);
-            display.print("HelloESP");
-            display.setCursor(28 + shiftX, 52);
-            display.print("helloesp.com");
-            break;
-        }
-        case 4: {
-            display.drawBitmap(39 + shiftX, 2, qrBitmap, 50, 50, WHITE);
-            display.setTextSize(1);
-            display.setCursor(28 + shiftX, 55);
-            display.print("helloesp.com");
-            break;
-        }
-        case 5: {
-            struct tm t;
-            if (getLocalTime(&t)) {
-                char timeBuf[8], subBuf[8], dateBuf[16];
-                strftime(timeBuf, sizeof(timeBuf), "%I:%M", &t);
-                if (timeBuf[0] == '0') memmove(timeBuf, timeBuf + 1, strlen(timeBuf));
-                strftime(subBuf, sizeof(subBuf), ":%S %p", &t);
-                strftime(dateBuf, sizeof(dateBuf), "%a, %b %d", &t);
-                display.setTextSize(3);
-                int tw = strlen(timeBuf) * 18;
-                int subW = strlen(subBuf) * 6;
-                int totalW = tw + subW;
-                int startX = (128 - totalW) / 2 + shiftX;
-                display.setCursor(startX, 8);
-                display.print(timeBuf);
-                display.setTextSize(1);
-                display.setCursor(startX + tw, 22);
-                display.print(subBuf);
-                int dw = strlen(dateBuf) * 6;
-                display.setCursor((128 - dw) / 2 + shiftX, 42);
-                display.print(dateBuf);
-            } else {
-                display.setTextSize(1);
-                display.setCursor(shiftX, 28);
-                display.print("No time sync");
-            }
-            break;
-        }
-    }
-
-    display.display();
+    renderDisplayPage();
 
     if (!ccsHealth.retired && ccs.available()) {
         ccs.setEnvironmentalData(safeBmeHumidity(), safeBmeTemp());
@@ -8126,32 +7785,24 @@ void loop() {
         if (minute % 5 == 0 && minute != lastLoggedMinute) {
             lastLoggedMinute = minute;
             logStats();
-            // SD.usedBytes() scans the whole FAT; "seconds" on a healthy
-            // card, but on a fragmented / heavy-use card it can block much
-            // longer and cascade into a WS drop. Refresh only at minute 0/30
-            // and time the call so we see it in the admin Error Log if it
-            // ever exceeds the threshold.
+            // LittleFS.usedBytes() is cheap on flash (no FAT scan). Refresh
+            // every 30 min for the homepage storage widget.
             if (minute == 0 || minute == 30) {
-                unsigned long sdStart = millis();
-                cachedSdUsedMB = (float)SD.usedBytes() / (1024.0f * 1024.0f);
-                unsigned long sdMs = millis() - sdStart;
-                if (sdMs > 3000) {
-                    char buf[80];
-                    snprintf(buf, sizeof(buf), "SD.usedBytes() blocked %lums (used=%.1fMB)",
-                             sdMs, cachedSdUsedMB);
-                    logError("perf", buf);
-                }
+                cachedFsUsedMB = (float)SD.usedBytes() / (1024.0f * 1024.0f);
             }
             Serial.println("Logged at: " + getTimestamp());
         }
     }
 
-    if (ledOn && (millis() - lastRequestTime >= LED_ON_TIME)) {
-        digitalWrite(LED_PIN, LOW);
-        ledOn = false;
+    // Alerts-only notification LED (GPIO2 onboard blue LED, active-low). Priority:
+    //   solid ON   = guestbook entries pending moderation
+    //   1Hz blink  = a sensor is degraded/failed
+    //   off        = all quiet
+    bool wantLed = pendingGuestbook > 0;
+    if (!wantLed && (bmeDegraded() || ccsDegraded())) {
+        wantLed = ((millis() / 1000) & 1) == 0; // slow blink
     }
-
-    digitalWrite(NOTIF_LED_PIN, pendingGuestbook > 0 ? HIGH : LOW);
+    digitalWrite(LED_PIN, wantLed ? LOW : HIGH);
 
     // log sensor degradation transitions once when they flip
     static bool wasBmeBad = false, wasCcsBad = false;
@@ -8458,20 +8109,6 @@ void loop() {
             testEmailDetail[sizeof(testEmailDetail) - 1] = '\0';
             struct tm tm;
             if (getLocalTime(&tm, 0)) testEmailAtUnix = mktime(&tm);
-        }
-    }
-
-    if (pendingSnakeClearFlag) {
-        pendingSnakeClearFlag = false;
-        if (wsConnected && wsClient.connected()) {
-            wsSendText(wsClient, String("{\"type\":\"event\",\"event\":\"snake_clear\"}"));
-        } else {
-            // Record a failure locally so the admin UI's polling sees the
-            // result instead of staring at stale data forever. Mirrors the
-            // r2_healthcheck / test_email offline fallback pattern.
-            snakeClearOk = false;
-            struct tm tm;
-            if (getLocalTime(&tm, 0)) snakeClearAtUnix = mktime(&tm);
         }
     }
 

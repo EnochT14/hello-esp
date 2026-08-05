@@ -8,9 +8,9 @@ admin_user=admin
 admin_pass=CHANGE_ME
 
 # Cloudflare Worker relay (optional, leave blank to skip)
-# worker_url accepts either a custom domain (e.g. "helloesp.com") or the
+# worker_url accepts either a custom domain (e.g. "esp.ecobbina.work") or the
 # default Cloudflare URL (e.g. "your-worker.workers.dev"). No protocol prefix.
-worker_url=helloesp.com
+worker_url=esp.ecobbina.work
 # worker_key must match the WORKER_SECRET set on the Worker side.
 # Generate with: openssl rand -hex 32
 worker_key=your-secret-key
@@ -25,7 +25,8 @@ device_key=
 #   CST6CDT,M3.2.0,M11.1.0  (US Central)
 #   MST7MDT,M3.2.0,M11.1.0  (US Mountain)
 #   PST8PDT,M3.2.0,M11.1.0  (US Pacific)
-timezone=UTC0
+#   GMT0                    (Ghana / Accra - no DST)
+timezone=GMT0
 
 # Worker-exclusive mode: when true, direct LAN hits to public pages
 # (/, /guestbook, /console, /history, /stats, etc.) are 302-redirected
@@ -52,6 +53,15 @@ worker_exclusive=false
 #   - Format: full URL with protocol, no trailing slash.
 #   - Example: http://<SHELLY_LAN_IP>/rpc/Switch.GetStatus?id=0
 shelly_url=
+
+# Optional: track power outages ("dumsor") on the microSD card. When enabled,
+# the firmware writes its last-seen epoch to /lastseen.txt every 5 minutes and,
+# once per boot after the clock syncs via NTP, records any gap longer than 90
+# seconds to /power_events.csv (columns: outage_start_unix, power_restored_unix,
+# down_seconds; capped at 500 rows). The /stats JSON and the on-device display
+# show the most recent outage plus monthly/total counts. Disable to skip all
+# SD writes and the display page.
+dumsor_tracking=true
 
 # Optional: grid energy cost in $/kWh for cost displays. Decimal value
 # (e.g. 0.13 for 13 cents/kWh). 0 = don't display cost anywhere. Sub-

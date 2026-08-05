@@ -450,8 +450,6 @@
         <a href="#sec-errors">Errors</a>
         <a href="#sec-files">Files</a>
         <a href="#sec-backup">Backup</a>
-        <a href="#chronicle-preview-section">Today</a>
-        <a href="#chronicle-section">Chronicle Notes</a>
         <a href="#maintenance-section" id="toc-maintenance">Maintenance</a>
         <a href="#do-section" class="danger">DO Explorer</a>
         <a href="#sec-firmware" class="danger">Firmware</a>
@@ -569,7 +567,7 @@
 
     <!-- files -->
     <div class="section" id="sec-files">
-        <div class="section-title">SD Card Files</div>
+        <div class="section-title">Storage Files</div>
         <div class="card">
             <div class="breadcrumb" id="breadcrumb"></div>
             <ul class="file-list" id="file-list"></ul>
@@ -586,7 +584,7 @@
 
     <!-- backup / restore -->
     <div class="section" id="sec-backup">
-        <div class="section-title">SD Card Backup & Restore</div>
+        <div class="section-title">Storage Backup & Restore</div>
         <div class="card">
             <button class="btn" id="backup-btn" onclick="startBackup()">Download Full Backup (.zip)</button>
             <div class="progress" id="backup-progress" style="display:none"><div class="progress-bar" id="backup-bar"></div></div>
@@ -631,56 +629,6 @@
         </div>
     </div>
 
-    <!-- chronicle today preview -->
-    <div class="section" id="chronicle-preview-section">
-        <div class="section-title">Chronicle: Today (in progress)</div>
-        <div class="card">
-            <div style="font-size:12px;color:var(--mid);line-height:1.7;margin-bottom:14px;">
-                Preview of what tonight's chronicle entry will look like
-                if it sealed right now. Re-renders on every refresh, so
-                the body shifts as the chip records more of the day. The
-                actual seal happens at chip-local midnight.
-            </div>
-            <div id="chronicle-preview" style="font-size:13px;line-height:1.7;color:var(--ink);">
-                <div style="color:var(--mid);font-style:italic;">Loading...</div>
-            </div>
-            <div style="margin-top:12px;display:flex;gap:8px;align-items:center;">
-                <button type="button" class="btn" id="chronicle-preview-refresh" style="font-size:11px;padding:6px 12px;">Refresh preview</button>
-                <span id="chronicle-preview-status" style="font-size:11px;color:var(--mid);"></span>
-            </div>
-        </div>
-    </div>
-
-    <!-- chronicle owner notes -->
-    <div class="section" id="chronicle-section">
-        <div class="section-title">Chronicle Notes</div>
-        <div class="card">
-            <div style="font-size:12px;color:var(--mid);line-height:1.7;margin-bottom:14px;">
-                Add a curatorial note to any sealed Chronicle entry. Notes
-                appear in italic above the auto-generated body on
-                <a href="/chronicle" target="_blank" style="color:var(--mid);">/chronicle</a>,
-                and post once as a reply to the entry's tweet on X. First
-                non-empty save posts; later edits update the website only.
-                Empty save clears the note (the X reply, if any, stays).
-                Latest 3 entries shown by default; X reply engagement is
-                strongest within hours of an entry's seal. Use the date
-                jumper or "show older" toggle below for retroactive notes
-                on older entries.
-            </div>
-            <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;">
-                <label for="chronicle-jump" style="font-size:11px;color:var(--mid);text-transform:uppercase;letter-spacing:0.1em;">
-                    Jump to date:
-                </label>
-                <input type="date" id="chronicle-jump" min="2026-05-04"
-                       style="font-family:inherit;font-size:12px;background:var(--bg);color:var(--ink);border:1px solid var(--faint);padding:4px 6px;">
-                <span id="chronicle-jump-status" style="font-size:11px;color:var(--mid);"></span>
-            </div>
-            <div id="chronicle-list" style="font-size:12px;">
-                <div style="color:var(--mid);">Loading...</div>
-            </div>
-            <div class="status" id="chronicle-status"></div>
-        </div>
-    </div>
 
     <!-- maintenance -->
     <div class="section" id="maintenance-section" style="display:none;">
@@ -728,9 +676,7 @@
                 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
                     <select id="do-prefix" style="font-size:12px;padding:5px 8px;background:transparent;color:var(--ink);border:1px solid var(--faint);border-radius:3px;">
                         <option value="">(all keys)</option>
-                        <option value="chronicle/">chronicle/</option>
                         <option value="sensor_retired/">sensor_retired/</option>
-                        <option value="snake/">snake/</option>
                         <option value="translate:">translate:</option>
                     </select>
                     <input type="text" id="do-search" placeholder="filter keys (substring)"
@@ -808,11 +754,6 @@
                 <button class="btn btn-small" onclick="sanitizeCsvs(this)">Drop out-of-spec CSV rows</button>
             </div>
             <div class="status" id="repair-status"></div>
-            <div style="font-size:12px;color:var(--mid);margin:18px 0 10px;">Snake leaderboard (Worker-side, public top 10):</div>
-            <div style="display:flex;flex-wrap:wrap;gap:8px;">
-                <button class="btn btn-small btn-danger" onclick="clearSnakeLeaderboard()">Clear leaderboard</button>
-            </div>
-            <div class="status" id="snake-clear-status"></div>
         </div>
     </div>
 
@@ -1242,7 +1183,7 @@
                     listEl.innerHTML = '<div style="color:var(--mid);">No .bin files in /fw/ yet. Upload one via the file manager below (path: <code>/fw/</code>).</div>';
                     return;
                 }
-                var html = '<div style="margin-bottom:6px;color:var(--mid);">Available on SD:</div>';
+                var html = '<div style="margin-bottom:6px;color:var(--mid);">Available in storage:</div>';
                 data.files.sort(function(a, b) { return b.mtime - a.mtime; });
                 for (var i = 0; i < data.files.length; i++) {
                     var f = data.files[i];
@@ -1508,7 +1449,7 @@
             }
             // "Currently active" banner: visible whenever the locally-tracked
             // window hasn't expired. Worker is authoritative; this is just so
-            // admin sees state at a glance instead of having to open helloesp.com.
+            // admin sees state at a glance instead of having to open esp.ecobbina.work.
             var mCurrent = document.getElementById('maintenance-current');
             var mDetail  = document.getElementById('maintenance-current-detail');
             if (mCurrent && mDetail) {
@@ -2274,76 +2215,6 @@
         xhr.send();
     }
 
-    function clearSnakeLeaderboard() {
-        var status = document.getElementById('snake-clear-status');
-        if (!dangerConfirm('Clear the public Snake leaderboard?\n\nDeletes all scores, initials, and dates from Worker storage. Cannot be undone.', 'CLEAR')) {
-            status.textContent = '';
-            status.className = 'status';
-            return;
-        }
-        status.textContent = 'Sending clear signal to Worker...';
-        status.className = 'status';
-        // Snapshot prior at_unix so we can detect when a fresh result lands.
-        // Only trust the baseline if the probe actually returned 200; if it
-        // didn't, leave baselineAt at 0 and accept ANY result as fresh, since
-        // we have no idea what the prior state was.
-        var baselineAt = 0;
-        var probe = new XMLHttpRequest();
-        probe.onreadystatechange = function() {
-            if (this.readyState !== 4) return;
-            if (this.status === 200) {
-                try {
-                    var d = JSON.parse(this.responseText);
-                    if (d && typeof d.at_unix === 'number') baselineAt = d.at_unix;
-                } catch (e) {}
-            }
-            // Now fire the trigger.
-            var xhr = new XMLHttpRequest();
-            xhr.onreadystatechange = function() {
-                if (this.readyState !== 4) return;
-                if (this.status !== 200) {
-                    status.textContent = this.responseText || ('HTTP ' + this.status);
-                    status.className = 'status err';
-                    return;
-                }
-                status.textContent = 'Waiting for Worker confirmation...';
-                pollSnakeClearResult(baselineAt, 0);
-            };
-            xhr.open('POST', '/admin/snake-clear', true);
-            xhr.send();
-        };
-        probe.open('GET', '/admin/snake-clear-result', true);
-        probe.send();
-    }
-
-    function pollSnakeClearResult(baselineAt, attempt) {
-        var status = document.getElementById('snake-clear-status');
-        if (attempt > 12) {  // 12 × 1s = 12s timeout
-            status.textContent = 'No confirmation from Worker (timed out). Leaderboard may or may not have cleared.';
-            status.className = 'status err';
-            return;
-        }
-        var xhr = new XMLHttpRequest();
-        xhr.onreadystatechange = function() {
-            if (this.readyState !== 4) return;
-            try {
-                var d = JSON.parse(this.responseText);
-                if (d && typeof d.at_unix === 'number' && d.at_unix > baselineAt) {
-                    if (d.ok) {
-                        status.textContent = 'Leaderboard cleared.';
-                        status.className = 'status ok';
-                    } else {
-                        status.textContent = 'Worker reported failure clearing leaderboard.';
-                        status.className = 'status err';
-                    }
-                    return;
-                }
-            } catch (e) {}
-            setTimeout(function() { pollSnakeClearResult(baselineAt, attempt + 1); }, 1000);
-        };
-        xhr.open('GET', '/admin/snake-clear-result', true);
-        xhr.send();
-    }
 
     function esc(str) {
         var d = document.createElement('div');
@@ -3424,278 +3295,6 @@
         }
     });
 
-    // Chronicle owner notes. Lists sealed entries from the worker's
-    // /chronicle.json and attaches a per-row textarea + save. Latest 14
-    // are visible by default; older entries are hidden behind a toggle.
-    // Date jumper input above scrolls to (and reveals if hidden) the row
-    // for any specific date so retroactive notes don't require manual
-    // scrolling through hundreds of entries.
-    function escAttr(s) { return esc(s).replace(/"/g, '&quot;'); }
-
-    // Tweet reply budget: 280 - 23 (t.co permalink) - 2 ("\n\n") = 255
-    // chars usable for note text before X truncates.
-    var CHRONICLE_NOTE_X_BUDGET = 255;
-    // Latest 3 entries shown by default (today + 2 prior days). Aligns with
-    // when adding a note actually has X engagement value: replies land on
-    // feeds while the original tweet is still fresh, mostly within ~6-12h
-    // of seal. Older entries remain accessible via the date jumper for
-    // retroactive curatorial notes.
-    var CHRONICLE_INITIAL_VISIBLE = 3;
-
-    function buildChronicleRowHtml(e) {
-        var dayLabel = e.day_number ? ' · Day ' + e.day_number : '';
-        var bodyPreview = (e.body || '').substring(0, 120);
-        if ((e.body || '').length > 120) bodyPreview += '...';
-        // X status badge: indicates whether the entry has been tweeted
-        // and whether the owner note has been replied. Helps the user
-        // see state before editing.
-        var xBadge = '';
-        if (e.posted_to_x) {
-            if (e.note_x_tweet_id) {
-                xBadge = '<span style="font-weight:400;color:var(--mid);font-size:10px;">posted · note replied</span>';
-            } else if (e.owner_note) {
-                xBadge = '<span style="font-weight:400;color:var(--mid);font-size:10px;">posted · note not replied</span>';
-            } else {
-                xBadge = '<span style="font-weight:400;color:var(--mid);font-size:10px;">posted</span>';
-            }
-        }
-        var noteReplied = !!e.note_x_tweet_id;
-        return '<div class="chronicle-row" data-date="' + escAttr(e.date) + '"'
-             + ' data-note-replied="' + (noteReplied ? '1' : '0') + '"'
-             + ' style="border-bottom:1px solid var(--faint);padding:10px 0;">'
-             + '<div style="font-weight:600;">' + esc(e.date) + esc(dayLabel)
-             +   (e.backfill ? ' <span style="font-weight:400;color:var(--mid);font-size:10px;">backfill</span>' : '')
-             +   (xBadge ? ' ' + xBadge : '')
-             + '</div>'
-             + '<div style="color:var(--mid);font-size:11px;line-height:1.5;margin:4px 0 8px;">' + esc(bodyPreview) + '</div>'
-             + '<textarea class="chronicle-note" placeholder="Curatorial note (italic, appears above the auto-body)"'
-             +   ' style="width:100%;min-height:50px;font-family:inherit;font-size:12px;background:var(--bg);color:var(--ink);border:1px solid var(--faint);padding:6px;resize:vertical;">'
-             +   esc(e.owner_note || '') + '</textarea>'
-             + (noteReplied
-                 ? '<div class="chronicle-replied-warn" style="font-size:11px;color:var(--mid);margin-top:4px;font-style:italic;">Already replied on X. Edits update the website only.</div>'
-                 : '')
-             + '<div style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
-             +   '<button class="btn btn-small chronicle-save">Save note</button>'
-             +   '<span class="chronicle-row-status" style="font-size:11px;color:var(--mid);"></span>'
-             +   '<span class="chronicle-charcount" style="font-size:11px;color:var(--mid);font-variant-numeric:tabular-nums;margin-left:auto;"></span>'
-             + '</div>'
-             + '</div>';
-    }
-
-    function updateCharCount(counterEl, text) {
-        var len = (text || '').length;
-        counterEl.textContent = len + ' / ' + CHRONICLE_NOTE_X_BUDGET;
-        if (len > CHRONICLE_NOTE_X_BUDGET) {
-            counterEl.style.color = '#b02030';
-            counterEl.title = 'Over X reply budget; tweet will truncate at last word boundary. Website shows full text.';
-        } else if (len > CHRONICLE_NOTE_X_BUDGET - 25) {
-            counterEl.style.color = '#c06b00';
-            counterEl.title = 'Approaching X reply budget (' + CHRONICLE_NOTE_X_BUDGET + ' chars).';
-        } else {
-            counterEl.style.color = 'var(--mid)';
-            counterEl.title = '';
-        }
-    }
-
-    function initialCharCounts(scope) {
-        var rows = scope.querySelectorAll('.chronicle-row');
-        for (var i = 0; i < rows.length; i++) {
-            var ta = rows[i].querySelector('.chronicle-note');
-            var counter = rows[i].querySelector('.chronicle-charcount');
-            if (ta && counter) updateCharCount(counter, ta.value);
-        }
-    }
-
-    function loadChronicleList() {
-        var el = document.getElementById('chronicle-list');
-        var url = (location.host === 'helloesp.com' || location.host === 'www.helloesp.com')
-            ? '/chronicle.json'
-            : 'https://helloesp.com/chronicle.json';
-        fetch(url, { cache: 'no-cache' })
-            .then(function(r) { return r.ok ? r.json() : Promise.reject(r.status); })
-            .then(function(data) {
-                var entries = (data && data.entries) || [];
-                if (entries.length === 0) {
-                    el.innerHTML = '<div style="color:var(--mid);">No entries yet. The first will be sealed at the next UTC midnight.</div>';
-                    return;
-                }
-                // entries arrives reverse-chronological from /chronicle.json,
-                // so slice() gives latest N for the visible portion.
-                var visible = entries.slice(0, CHRONICLE_INITIAL_VISIBLE);
-                var hidden  = entries.slice(CHRONICLE_INITIAL_VISIBLE);
-                var html = '<div id="chronicle-visible">';
-                for (var i = 0; i < visible.length; i++) {
-                    html += buildChronicleRowHtml(visible[i]);
-                }
-                html += '</div>';
-                if (hidden.length > 0) {
-                    html += '<div id="chronicle-hidden" hidden>';
-                    for (var j = 0; j < hidden.length; j++) {
-                        html += buildChronicleRowHtml(hidden[j]);
-                    }
-                    html += '</div>';
-                    html += '<button type="button" class="btn btn-small" id="chronicle-show-older" style="margin-top:14px;">'
-                          + 'Show older entries (' + hidden.length + ')</button>';
-                }
-                el.innerHTML = html;
-                initialCharCounts(el);
-                var olderBtn = document.getElementById('chronicle-show-older');
-                if (olderBtn) {
-                    olderBtn.addEventListener('click', function() {
-                        var hiddenWrap = document.getElementById('chronicle-hidden');
-                        if (!hiddenWrap) return;
-                        if (hiddenWrap.hasAttribute('hidden')) {
-                            hiddenWrap.removeAttribute('hidden');
-                            olderBtn.textContent = 'Hide older entries';
-                        } else {
-                            hiddenWrap.setAttribute('hidden', '');
-                            olderBtn.textContent = 'Show older entries (' + hidden.length + ')';
-                        }
-                    });
-                }
-            })
-            .catch(function() {
-                el.innerHTML = '<div style="color:#b02030;">Could not load Chronicle entries.</div>';
-            });
-    }
-    // Live char-counter on every chronicle textarea via event delegation.
-    document.getElementById('chronicle-list').addEventListener('input', function(ev) {
-        if (!ev.target.classList || !ev.target.classList.contains('chronicle-note')) return;
-        var row = ev.target.closest('.chronicle-row');
-        if (!row) return;
-        var counter = row.querySelector('.chronicle-charcount');
-        if (counter) updateCharCount(counter, ev.target.value);
-    });
-
-    // Date jumper: scroll to the row for the picked date, expanding the
-    // older-entries section if the row lives there. Date format is YYYY-MM-DD
-    // from the native <input type="date"> control.
-    document.getElementById('chronicle-jump').addEventListener('change', function(ev) {
-        var date = ev.target.value;
-        var statusEl = document.getElementById('chronicle-jump-status');
-        if (!date) { statusEl.textContent = ''; return; }
-        var row = document.querySelector('.chronicle-row[data-date="' + date + '"]');
-        if (!row) {
-            statusEl.textContent = 'No entry for ' + date;
-            statusEl.style.color = '#b02030';
-            return;
-        }
-        // Reveal hidden section if the row is in it.
-        var hiddenWrap = document.getElementById('chronicle-hidden');
-        if (hiddenWrap && hiddenWrap.contains(row) && hiddenWrap.hasAttribute('hidden')) {
-            hiddenWrap.removeAttribute('hidden');
-            var olderBtn = document.getElementById('chronicle-show-older');
-            if (olderBtn) olderBtn.textContent = 'Hide older entries';
-        }
-        statusEl.textContent = 'Jumped to ' + date;
-        statusEl.style.color = 'var(--mid)';
-        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        // Defer focus so the smooth-scroll animation completes first.
-        var ta = row.querySelector('.chronicle-note');
-        if (ta) setTimeout(function() { ta.focus(); }, 350);
-    });
-
-    document.getElementById('chronicle-list').addEventListener('click', function(ev) {
-        var btn = ev.target.closest('.chronicle-save');
-        if (!btn) return;
-        var row = btn.closest('.chronicle-row');
-        if (!row) return;
-        var date = row.getAttribute('data-date');
-        var note = row.querySelector('.chronicle-note').value;
-        var statusEl = row.querySelector('.chronicle-row-status');
-        statusEl.textContent = 'Saving...';
-        statusEl.style.color = 'var(--mid)';
-        var body = 'date=' + encodeURIComponent(date) + '&note=' + encodeURIComponent(note);
-        fetch('/admin/chronicle/note', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: body
-        }).then(function(r) {
-            if (r.ok) {
-                statusEl.textContent = 'Saved.';
-                statusEl.style.color = 'var(--ok, #0a8b4a)';
-                setTimeout(function() { statusEl.textContent = ''; }, 2000);
-            } else if (r.status === 503) {
-                statusEl.textContent = 'Worker offline; try again.';
-                statusEl.style.color = '#b02030';
-            } else {
-                statusEl.textContent = 'Save failed (HTTP ' + r.status + ').';
-                statusEl.style.color = '#b02030';
-            }
-        }).catch(function() {
-            statusEl.textContent = 'Save failed.';
-            statusEl.style.color = '#b02030';
-        });
-    });
-
-    // Chronicle preview: fetches today's in-progress snapshot rendered
-    // through templates as if sealing right now. Worker-only data so we
-    // hit it cross-origin when admin loads from LAN; same /chronicle.json
-    // origin pattern as the Notes section.
-    function loadChronicleTodayPreview() {
-        var el = document.getElementById('chronicle-preview');
-        var statusEl = document.getElementById('chronicle-preview-status');
-        var url = (location.host === 'helloesp.com' || location.host === 'www.helloesp.com')
-            ? '/chronicle/preview' : 'https://helloesp.com/chronicle/preview';
-        if (statusEl) statusEl.textContent = 'Loading...';
-        fetch(url, { cache: 'no-store' })
-            .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
-            .then(function (p) {
-                if (!p || !p.body) {
-                    el.innerHTML = '<div style="color:var(--mid);font-style:italic;">No in-progress snapshot yet.</div>';
-                    if (statusEl) statusEl.textContent = '';
-                    return;
-                }
-                var dayLabel = p.day_number ? 'Day ' + p.day_number + ' &middot; ' : '';
-                // Use unicode · directly (not the HTML entity &middot;) since
-                // ageStr is assigned via textContent below. Entities would
-                // render as literal characters there, and any HTML-stripping
-                // sanitization on the way out is both redundant and (per
-                // CodeQL) susceptible to nested-tag bypasses if ever migrated
-                // to innerHTML. Keeping the source clean is the right defense.
-                var ageStr = p.snapshot_age_seconds != null
-                    ? ' · ' + p.snapshot_age_seconds + 's since last sample'
-                    : '';
-                var stats = p.stats || {};
-                var bits = [];
-                if (stats.visitors != null) bits.push(stats.visitors + ' visitors');
-                if (stats.countries != null) bits.push(stats.countries + ' countries');
-                if (stats.co2_max != null) bits.push('CO₂ ' + (stats.co2_min || 0) + '–' + stats.co2_max + ' ppm');
-                if (stats.temp_max_f != null) bits.push(Math.round(stats.temp_min_f) + '–' + Math.round(stats.temp_max_f) + '°F');
-                if (stats.samples != null) bits.push(stats.samples + ' samples');
-                var statBar = bits.length
-                    ? '<div style="font-size:11px;color:var(--mid);letter-spacing:0.05em;margin-top:10px;">'
-                       + bits.map(function (b) { return esc(b); }).join(' &middot; ') + '</div>'
-                    : '';
-                var pillStyle = 'font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--mid);'
-                              + 'border:1px solid var(--faint);padding:2px 6px;border-radius:2px;margin-left:8px;';
-                // Friendly label mapping mirrors chronicle.html's
-                // displayTemplateId. Empty for generic so the pill hides
-                // entirely on ordinary days.
-                var rawTpl = (p.template_id || 'generic');
-                var friendlyTpl = ({busy_rel:'busy',quiet_rel:'quiet',generic:''})[rawTpl];
-                var tplShown = friendlyTpl !== undefined ? friendlyTpl : rawTpl;
-                el.innerHTML =
-                    '<div style="font-size:11px;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink);font-weight:500;">'
-                  + dayLabel + esc(p.date)
-                  + (tplShown ? '<span style="' + pillStyle + '">' + esc(tplShown) + '</span>' : '')
-                  + '</div>'
-                  + '<div style="margin-top:8px;white-space:pre-line;">' + esc(p.body) + '</div>'
-                  + statBar;
-                if (statusEl) {
-                    // textContent doesn't parse HTML, so no sanitization needed.
-                    // ageStr is built locally above with unicode · already, so
-                    // no entity-decoding pass is needed either.
-                    statusEl.textContent = 'Updated' + ageStr;
-                }
-            })
-            .catch(function () {
-                el.innerHTML = '<div style="color:#b02030;">Could not load preview.</div>';
-                if (statusEl) statusEl.textContent = '';
-            });
-    }
-    var chronicleRefreshBtn = document.getElementById('chronicle-preview-refresh');
-    if (chronicleRefreshBtn) chronicleRefreshBtn.addEventListener('click', loadChronicleTodayPreview);
 
     // DO Storage Explorer. Read-only inspection plus delete-by-key for the
     // worker's Durable Object storage. Operator types WORKER_SECRET each
@@ -3704,12 +3303,12 @@
     // calls use Authorization: Bearer header so the secret never appears
     // in URLs (history, referrer headers, server logs). The worker proxy
     // pattern (cross-origin from chip-served LAN admin to public worker
-    // endpoints) mirrors the existing /chronicle/translate flow used by
+    // endpoints) mirrors the existing /guestbook/translate flow used by
     // the guestbook, so CORS handling is already in place worker-side.
     (function () {
         var workerSecret = '';
-        var WORKER_BASE = (location.host === 'helloesp.com' || location.host === 'www.helloesp.com')
-            ? '' : 'https://helloesp.com';
+        var WORKER_BASE = (location.host === 'esp.ecobbina.work' || location.host === 'www.esp.ecobbina.work')
+            ? '' : 'https://esp.ecobbina.work';
         var authRow = document.getElementById('do-auth-row');
         var tools = document.getElementById('do-tools');
         var secretInput = document.getElementById('do-secret');
@@ -3921,8 +3520,6 @@
     loadFiles('/');
     loadBackupStatus();
     loadFirmwareList();
-    loadChronicleList();
-    loadChronicleTodayPreview();
 
     // 30s polling so sparklines, maintenance countdown, and worker-link
     // state stay live. Paused on hidden tab to avoid background polling.
