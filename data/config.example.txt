@@ -75,3 +75,22 @@ cost_per_kwh=0
 #   0.485  US Colorado mix (coal/gas/wind blend)
 #   0.386  US national average
 co2_per_kwh=0
+
+# Optional: live aircraft tracking (ADS-B) from a local piaware / dump1090
+# receiver. The ESP polls the receiver's JSON feed and serves the result as
+# /adsb.json (LAN viewers) and pushes "adsb_update" events over the Worker
+# SSE stream (public /adsb page with a Leaflet map). Leave adsb_url blank to
+# disable; the homepage strip and /adsb page then hide themselves.
+#
+#   adsb_url: full poll URL. For piaware/fa-style receivers use the aircraft
+#             JSON endpoint (default below). For dump1090-fa use
+#             http://<RECEIVER_IP>:8080/data/aircraft.json
+#   adsb_track: optional space-separated ICAO hex list to track only
+#               specific aircraft (e.g. "4ca7e2 89a05c"). Blank = show all
+#               position-known aircraft within range. Max 24 hex IDs.
+#   adsb_poll_ms: poll interval (default 5000).
+#   adsb_max: max aircraft kept (default 25, hard cap 60).
+adsb_url=http://192.168.100.2:8080/data/aircraft.json
+adsb_track=
+adsb_poll_ms=5000
+adsb_max=25

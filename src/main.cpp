@@ -83,6 +83,16 @@ bool cfgWorkerExclusive = false;
 // display page shows an "off" notice. Defaults to on when the config key is
 // absent.
 bool cfgDumsorTracking = true;
+// Optional ADS-B feed (piaware / dump1090-fa on the LAN). The ESP polls the
+// receiver's /data/aircraft.json every cfgAdsbPollMs, stream-parses it in
+// constant memory, filters to the tracked hex list (or everything in range,
+// capped at cfgAdsbMax), then serves the compact fleet via /adsb.json (LAN)
+// and "adsb_update" WS events (public SSE fanout). Defaults to the standard
+// piaware web port; override in config.txt, set blank to disable.
+char cfgAdsbUrl[96]    = "http://192.168.100.2:8080";
+char cfgAdsbTrack[128] = "";
+int  cfgAdsbPollMs     = 5000;
+int  cfgAdsbMax        = 25;
 
 const long  gmtOffset_sec      = 0;
 const int   daylightOffset_sec = 0;
@@ -311,6 +321,40 @@ volatile uint32_t shellyConsecutiveFailures  = 0;
 volatile int      lastShellyHttpStatus       = 0;
 char shelly_today_date[11] = "";  // YYYY-MM-DD captured at last today rollover
 uint32_t shelly_tracking_started_unix = 0; // when we first saw a Shelly poll succeed
+
+// --- ADS-B live aircraft tracking (piaware / dump1090-fa) ---
+// The receiver's /data/aircraft.json is a full snapshot that can reach
+// 100KB+ at busy feeders; this chip has ~180KB free heap. So the poll
+// STREAMS the body through a hand-rolled JSON state machine (no full-body
+// buffer, no per-aircraft String) and keeps only the filtered subset in a
+// fixed array. The fleet is a snapshot semantics: every successful poll
+// replaces it wholesale, which keeps piaware restart recovery free (next
+// poll just works) and makes the change-detection at push time trivial.
+#define ADSB_MAX_TRACKED 60
+#define ADSB_HEX_LEN     7     // 6 hex chars + null
+#define ADSB_FLIGHT_LEN  9     // 8 chars + null (dump1090 callsigns are 8 max)
+#define ADSB_TRACKED_MAX 16    // hexes accepted in adsb_track config
+#define ADSB_STALE_S     120   // drop aircraft unseen for >120s regardless
+struct AdsbAircraft {
+    char  hex[ADSB_HEX_LEN];
+    char  flight[ADSB_FLIGHT_LEN];
+    float lat;                 // NAN = unknown
+    float lon;                 // NAN = unknown
+    int   alt_baro;            // ft; INT_MIN = unknown, 0 = "ground"
+    float gs;                  // kt; NAN = unknown
+    float track;               // deg true; NAN = unknown
+    int   squawk;              // 0 = unknown
+    char  category[3];         // "A3" etc.; "" = unknown
+    int   seen;                // seconds since last message (from piaware)
+};
+AdsbAircraft adsbFleet[ADSB_MAX_TRACKED];
+volatile int            adsbCount         = 0;
+volatile unsigned long  lastAdsbGoodAt    = 0;
+volatile unsigned long  lastAdsbAttemptMs = 0;
+volatile int            lastAdsbHttpStatus = 0; // 200 ok / HTTP code / negative transport / -100 parse
+volatile bool           adsbDirty          = false; // fleet changed since last WS push
+char adsbTrackHexes[ADSB_TRACKED_MAX][ADSB_HEX_LEN];  // uppercase, built from cfgAdsbTrack at boot
+int  adsbTrackCount = 0;
 
 // BME280 datasheet operating ranges. Out-of-spec reads almost always indicate
 // I2C bus glitches (corrupted register reads from bus contention or wire
@@ -1462,6 +1506,7 @@ static bool consoleShouldSkip(const String& url) {
     if (url == "/records.json")     return true;
     if (url == "/console.json")     return true;
     if (url == "/history.json")     return true;
+    if (url == "/adsb.json")        return true; // polled every 5s by the /adsb page + homepage strip; not a real visit
     if (url == "/guestbook/entries") return true;
     if (url == "/guestbook/submit")  return true;
     // bot-only metadata
@@ -2516,6 +2561,324 @@ void pollShelly() {
         saveRecords();
         initialRecordsSavedThisBoot = true;
     }
+}
+
+// --- ADS-B streaming parser (piaware /data/aircraft.json) ---
+// One char at a time, constant memory: fixed-size key/token/number slots
+// plus the single in-progress aircraft being assembled. Tolerates
+// whitespace, missing fields, string-or-number squawk/alt, unknown keys,
+// nested objects, and escapes. No full-body buffer, no per-aircraft String.
+enum AdsbScan {
+    A_TOP,      // top level: only key strings matter
+    A_IN_ARRAY, // inside "aircraft":[ ... ]
+    A_OBJ_KEY,  // after { or , inside an aircraft object: expect key string
+    A_COLON,    // after a key string: expect ':'
+    A_VALUE,    // after ':': expect string / number / word / { / [
+    A_STR,      // inside a quoted string
+    A_NUM,      // inside a number token
+    A_WORD,     // inside true/false/null
+    A_SKIP,     // skipping an unknown nested object/array (depth-tracked)
+    A_DONE      // saw the closing ] of the aircraft array
+};
+
+struct AdsbParser {
+    AdsbScan state = A_TOP;
+    char  key[12];       int  keyLen = 0;
+    char  tok[16];       int  tokLen = 0;    // string-value capture
+    char  numBuf[16];    int  numLen = 0;    // number capture
+    bool  strIsKey = false;                  // current string is a key, not a value
+    bool  inObj = false;                     // inside an aircraft object
+    bool  keyIsAircraft = false;             // last top-level key was "aircraft"
+    bool  inEscape = false;
+    // aircraft being assembled
+    char  acHex[ADSB_HEX_LEN];     int acHexLen = 0;
+    char  acFlight[ADSB_FLIGHT_LEN]; int acFlightLen = 0;
+    char  acCategory[3];           int acCategoryLen = 0;
+    float acLat, acLon, acGs, acTrack;
+    bool  hasLat, hasLon, hasGs, hasTrack, hasAlt;
+    int   acAlt, acSquawk, acSeen;
+    int   skipDepth = 0;
+    bool  ok = false;    // saw the closing ']' of the aircraft array
+};
+
+static bool adsbHexTracked(const char* hex) {
+    for (int t = 0; t < adsbTrackCount; t++) {
+        if (strcmp(adsbTrackHexes[t], hex) == 0) return true;
+    }
+    return false;
+}
+
+static void adsbAssignNumber(AdsbParser& p, const char* num) {
+    if (p.inObj) {
+        if (strcmp(p.key, "lat") == 0)       { p.acLat = atof(num); p.hasLat = true; }
+        else if (strcmp(p.key, "lon") == 0)  { p.acLon = atof(num); p.hasLon = true; }
+        else if (strcmp(p.key, "track") == 0){ p.acTrack = atof(num); p.hasTrack = true; }
+        else if (strcmp(p.key, "gs") == 0)   { p.acGs = atof(num); p.hasGs = true; }
+        else if (strcmp(p.key, "alt_baro") == 0) { p.acAlt = atoi(num); p.hasAlt = true; }
+        else if (strcmp(p.key, "squawk") == 0)   { p.acSquawk = atoi(num); }
+        else if (strcmp(p.key, "seen") == 0)     { p.acSeen = atoi(num); }
+    }
+}
+
+static void adsbAssignString(AdsbParser& p) {
+    p.tok[p.tokLen] = '\0';
+    if (!p.inObj) return;
+    if (strcmp(p.key, "hex") == 0) {
+        p.acHexLen = 0;
+        for (int i = 0; i < p.tokLen && i < ADSB_HEX_LEN - 1; i++) {
+            char c = p.tok[i];
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+                p.acHex[p.acHexLen++] = (char)toupper((unsigned char)c);
+            }
+        }
+        p.acHex[p.acHexLen] = '\0';
+    } else if (strcmp(p.key, "flight") == 0) {
+        p.acFlightLen = 0;
+        for (int i = 0; i < p.tokLen && p.acFlightLen < ADSB_FLIGHT_LEN - 1; i++) {
+            char c = p.tok[i];
+            // only safe printable chars: callsigns are A-Z/0-9/spaces; strip
+            // anything else so JSON output can't be injected via this field
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == ' ') {
+                p.acFlight[p.acFlightLen++] = (char)toupper((unsigned char)c);
+            }
+        }
+        p.acFlight[p.acFlightLen] = '\0';
+        while (p.acFlightLen > 0 && p.acFlight[p.acFlightLen - 1] == ' ') {
+            p.acFlight[--p.acFlightLen] = '\0';
+        }
+    } else if (strcmp(p.key, "category") == 0) {
+        p.acCategoryLen = 0;
+        for (int i = 0; i < p.tokLen && p.acCategoryLen < 2; i++) {
+            char c = p.tok[i];
+            if (isalnum((unsigned char)c)) p.acCategory[p.acCategoryLen++] = (char)toupper((unsigned char)c);
+        }
+        p.acCategory[p.acCategoryLen] = '\0';
+    } else if (strcmp(p.key, "squawk") == 0) {
+        p.acSquawk = atoi(p.tok);
+    } else if (strcmp(p.key, "alt_baro") == 0) {
+        // dump1090 emits "ground" for aircraft on the ground
+        p.acAlt = 0;
+        p.hasAlt = true;
+    }
+}
+
+static bool adsbKeepAircraft(const AdsbParser& p) {
+    if (p.acHexLen != 6) return false;
+    if (p.acSeen > ADSB_STALE_S) return false;
+    if (adsbTrackCount > 0) return adsbHexTracked(p.acHex);
+    return p.hasLat && p.hasLon;
+}
+
+static void adsbStoreAircraft(const AdsbParser& p) {
+    if (adsbCount >= ADSB_MAX_TRACKED) return;
+    AdsbAircraft& a = adsbFleet[adsbCount];
+    memcpy(a.hex, p.acHex, ADSB_HEX_LEN);
+    if (p.acFlightLen > 0) {
+        memcpy(a.flight, p.acFlight, p.acFlightLen);
+        a.flight[p.acFlightLen] = '\0';
+    } else {
+        a.flight[0] = '\0';
+    }
+    a.lat      = p.hasLat ? p.acLat : NAN;
+    a.lon      = p.hasLon ? p.acLon : NAN;
+    a.alt_baro = p.hasAlt ? p.acAlt : INT_MIN;
+    a.gs       = p.hasGs ? p.acGs : NAN;
+    a.track    = p.hasTrack ? p.acTrack : NAN;
+    a.squawk   = p.acSquawk;
+    a.category[0] = p.acCategoryLen ? p.acCategory[0] : '\0';
+    a.category[1] = p.acCategoryLen > 1 ? p.acCategory[1] : '\0';
+    a.category[2] = '\0';
+    a.seen     = p.acSeen;
+    adsbCount++;
+}
+
+static void adsbParseChar(AdsbParser& p, char c) {
+    switch (p.state) {
+    case A_TOP:
+        if (c == '"') { p.keyLen = 0; p.strIsKey = true; p.state = A_STR; }
+        break;
+    case A_IN_ARRAY:
+        if (c == '{') {
+            p.inObj = true;
+            p.acHexLen = p.acFlightLen = p.acCategoryLen = 0;
+            p.acHex[0] = p.acFlight[0] = p.acCategory[0] = '\0';
+            p.hasLat = p.hasLon = p.hasGs = p.hasTrack = p.hasAlt = false;
+            p.acLat = p.acLon = p.acGs = p.acTrack = NAN;
+            p.acAlt = p.acSquawk = p.acSeen = 0;
+            p.state = A_OBJ_KEY;
+        } else if (c == ']') { p.ok = true; p.state = A_DONE; }
+        break;
+    case A_OBJ_KEY:
+        if (c == '"') { p.keyLen = 0; p.strIsKey = true; p.state = A_STR; }
+        else if (c == '}') { p.inObj = false; p.state = A_IN_ARRAY; }  // empty object
+        break;
+    case A_COLON:
+        if (c == ':') p.state = A_VALUE;
+        break;
+    case A_VALUE:
+        if (c == '"') { p.tokLen = 0; p.strIsKey = false; p.state = A_STR; }
+        else if (c == '-' || (c >= '0' && c <= '9')) {
+            p.numLen = 0;
+            p.numBuf[p.numLen++] = c;
+            p.state = A_NUM;
+        } else if (c == 't' || c == 'f' || c == 'n') { p.state = A_WORD; }
+        else if (c == '{' || c == '[') {
+            // The "aircraft" array is the payload we track: enter it. Any
+            // other nested object/array (e.g. a non-aircraft value, or a
+            // nested config block) is skipped depth-tracked.
+            if (c == '[' && !p.inObj && p.keyIsAircraft) {
+                p.state = A_IN_ARRAY;
+                p.keyIsAircraft = false;
+            } else {
+                p.skipDepth = 0;
+                p.state = A_SKIP;
+            }
+        }
+        else if (c == ',') { p.state = p.inObj ? A_OBJ_KEY : A_TOP; }
+        else if (c == '}') {
+            if (p.inObj) {
+                p.inObj = false;
+                if (adsbKeepAircraft(p)) adsbStoreAircraft(p);
+                p.state = A_IN_ARRAY;
+            }
+        } else if (c == ']') { p.ok = true; p.state = A_DONE; }
+        break;
+    case A_STR:
+        if (p.inEscape) { p.inEscape = false; break; }
+        if (c == '\\') { p.inEscape = true; break; }
+        if (c == '"') {
+            if (p.strIsKey) {
+                p.key[p.keyLen] = '\0';
+                if (!p.inObj && strcmp(p.key, "aircraft") == 0) p.keyIsAircraft = true;
+                p.state = A_COLON;
+            } else {
+                adsbAssignString(p);
+                p.state = A_VALUE;
+            }
+            break;
+        }
+        if (p.strIsKey) {
+            if (p.keyLen < 11) p.key[p.keyLen++] = c;
+        } else if (p.tokLen < (int)sizeof(p.tok) - 1) {
+            p.tok[p.tokLen++] = c;
+        }
+        break;
+    case A_NUM:
+        if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == 'e' || c == 'E') {
+            if (p.numLen < (int)sizeof(p.numBuf) - 1) p.numBuf[p.numLen++] = c;
+        } else {
+            p.numBuf[p.numLen] = '\0';
+            adsbAssignNumber(p, p.numBuf);
+            p.state = A_VALUE;
+            adsbParseChar(p, c);  // re-process the delimiter
+        }
+        break;
+    case A_WORD:
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+            p.state = A_VALUE;
+            adsbParseChar(p, c);  // re-process the delimiter
+        }
+        break;
+    case A_SKIP:
+        if (c == '{' || c == '[') p.skipDepth++;
+        else if (c == '}' || c == ']') {
+            if (p.skipDepth == 0) p.state = A_VALUE;
+            else p.skipDepth--;
+        }
+        break;
+    case A_DONE:
+        break;
+    }
+}
+
+// Poll the local piaware / dump1090-fa receiver. Modeled on pollShelly():
+// synchronous HTTPClient, bounded timeout, silently keeps the previous
+// fleet on any failure. Success replaces the fleet wholesale (snapshot
+// semantics), so a piaware restart costs nothing beyond one empty poll.
+void pollAdsb() {
+    if (cfgAdsbUrl[0] == '\0') return;
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    lastAdsbAttemptMs = millis();
+
+    HTTPClient http;
+    http.setTimeout(2000);
+    // Accept both "http://host:8080" (we append the feed path) and the full
+    // "http://host:8080/data/aircraft.json" from config examples.
+    String url = String(cfgAdsbUrl);
+    if (!url.endsWith("/data/aircraft.json")) url += "/data/aircraft.json";
+    if (!http.begin(url)) {
+        lastAdsbHttpStatus = -1;
+        return;
+    }
+    int code = http.GET();
+    if (code != 200) {
+        lastAdsbHttpStatus = (code > 0) ? code : -1;
+        http.end();
+        return;
+    }
+
+    AdsbParser p;
+    // Build the new fleet from index 0 (snapshot semantics). If the parse
+    // fails partway, restore the previous count so the last good fleet
+    // survives (silently keeps the previous fleet on failure).
+    int savedCount = adsbCount;
+    adsbCount = 0;
+    WiFiClient* stream = http.getStreamPtr();
+    unsigned long readStart = millis();
+    unsigned long byteCount = 0;
+    while (!p.ok && stream->connected() && millis() - readStart < 4000) {
+        if (!stream->available()) {
+            if (byteCount > 0 && millis() - readStart > 1500) break;  // EOF-ish stall
+            delay(1);
+            continue;
+        }
+        int b = stream->read();
+        if (b < 0) break;
+        adsbParseChar(p, (char)b);
+        byteCount++;
+        // Yield periodically so async_tcp can run during a big body read.
+        if ((byteCount & 1023) == 0) delay(1);
+    }
+    http.end();
+
+    if (!p.ok) {
+        adsbCount = savedCount;  // restore previous fleet
+        lastAdsbHttpStatus = -100;  // truncated / malformed body
+        return;
+    }
+    lastAdsbHttpStatus = 200;
+    lastAdsbGoodAt = millis();
+    adsbDirty = true;
+}
+
+// Compact JSON of the current fleet for /adsb.json and WS pushes. Only
+// known fields are emitted; keys are short so the wire cost stays tiny.
+static String serializeAdsbJson() {
+    String s;
+    s.reserve(128 + (size_t)adsbCount * 96);
+    s = "{\"now\":";
+    time_t t = time(nullptr);
+    s += (t > 0) ? String((long)t) : "0";
+    s += ",\"aircraft\":[";
+    for (int i = 0; i < adsbCount; i++) {
+        const AdsbAircraft& a = adsbFleet[i];
+        if (i) s += ",";
+        s += "{\"hex\":\""; s += a.hex; s += "\"";
+        if (a.flight[0]) { s += ",\"f\":\""; s += a.flight; s += "\""; }
+        if (!isnan(a.lat)) { s += ",\"lat\":"; s += String(a.lat, 5); }
+        if (!isnan(a.lon)) { s += ",\"lon\":"; s += String(a.lon, 5); }
+        if (a.alt_baro != INT_MIN) { s += ",\"alt\":"; s += String(a.alt_baro); }
+        if (!isnan(a.gs)) { s += ",\"gs\":"; s += String(a.gs, 1); }
+        if (!isnan(a.track)) { s += ",\"trk\":"; s += String(a.track, 1); }
+        if (a.squawk > 0) { s += ",\"sq\":"; s += String(a.squawk); }
+        if (a.category[0]) { s += ",\"cat\":\""; s += a.category; s += "\""; }
+        s += ",\"seen\":"; s += String(a.seen);
+        s += "}";
+    }
+    s += "]}";
+    return s;
 }
 
 void notifyPendingIfIncreased() {
@@ -3921,9 +4284,45 @@ void setup() {
                 if (key == "shelly_url")  val.toCharArray(cfgShellyUrl, sizeof(cfgShellyUrl));
                 if (key == "cost_per_kwh") cfgCostPerKwh = val.toFloat();
                 if (key == "co2_per_kwh")  cfgCo2PerKwh  = val.toFloat();
+                if (key == "adsb_url")     val.toCharArray(cfgAdsbUrl, sizeof(cfgAdsbUrl));
+                if (key == "adsb_track")   val.toCharArray(cfgAdsbTrack, sizeof(cfgAdsbTrack));
+                if (key == "adsb_poll_ms") cfgAdsbPollMs = val.toInt();
+                if (key == "adsb_max")     cfgAdsbMax = val.toInt();
+            }
+            if (cfgAdsbPollMs < 2000) cfgAdsbPollMs = 2000;
+            if (cfgAdsbPollMs > 30000) cfgAdsbPollMs = 30000;
+            if (cfgAdsbMax < 1) cfgAdsbMax = 1;
+            if (cfgAdsbMax > ADSB_MAX_TRACKED) cfgAdsbMax = ADSB_MAX_TRACKED;
+            // Build the tracked-hex list (uppercase) from adsb_track, e.g.
+            // "a4b2c3,ab1234". Empty list = track everything in range.
+            adsbTrackCount = 0;
+            {
+                const char* p = cfgAdsbTrack;
+                while (*p && adsbTrackCount < ADSB_TRACKED_MAX) {
+                    while (*p == ',' || *p == ' ' || *p == '\t') p++;
+                    if (!*p) break;
+                    char hex[ADSB_HEX_LEN];
+                    int n = 0;
+                    while (*p && *p != ',' && n < 6) {
+                        hex[n++] = (char)toupper((unsigned char)*p);
+                        p++;
+                    }
+                    hex[n] = '\0';
+                    bool valid = (n == 6);
+                    for (int i = 0; i < n && valid; i++) {
+                        if (!isxdigit((unsigned char)hex[i])) valid = false;
+                    }
+                    if (valid) {
+                        strncpy(adsbTrackHexes[adsbTrackCount], hex, ADSB_HEX_LEN - 1);
+                        adsbTrackHexes[adsbTrackCount][ADSB_HEX_LEN - 1] = '\0';
+                        adsbTrackCount++;
+                    }
+                    while (*p == ',') p++;
+                }
             }
             bootLog("[fs] config loaded");
             bootLog(cfgShellyUrl[0] != '\0' ? "[net] shelly: on" : "[net] shelly: off");
+            bootLog(cfgAdsbUrl[0] != '\0' ? "[net] adsb: on" : "[net] adsb: off");
         }
     } else {
         Serial.println("No config.txt found");
@@ -4233,6 +4632,25 @@ void setup() {
         logConsole(request, 200);
     });
 
+    // Registered BEFORE /adsb: ESPAsyncWebServer path matching is prefix-
+    // based, so server.on("/adsb", ...) would swallow "/adsb.json".
+    server.on("/adsb.json", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (redirectLanToWorker(request)) return;
+        String json = serializeAdsbJson();
+        AsyncWebServerResponse *r = request->beginResponse(200, "application/json", json);
+        r->addHeader("Cache-Control", "no-store");
+        request->send(r);
+        logConsole(request, 200);
+    });
+
+    server.on("/adsb", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (redirectLanToWorker(request)) return;
+        AsyncWebServerResponse *r = beginResponseGzipOrRaw(request, "/adsb.html", "text/html");
+        r->addHeader("Cache-Control", "public, max-age=300");
+        request->send(r);
+        logConsole(request, 200);
+    });
+
     // (Removed in the core-site port: /snake and /chronicle routes, pages,
     // and their WS/admin plumbing. Snake score storage lived worker-side.)
 
@@ -4394,6 +4812,7 @@ void setup() {
             "Disallow: /console.json\n"
             "Disallow: /history.json\n"
             "Disallow: /records.json\n"
+            "Disallow: /adsb.json\n"
             "\n"
             "Sitemap: https://esp.ecobbina.work/sitemap.xml\n");
     });
@@ -4406,6 +4825,7 @@ void setup() {
             "  <url><loc>https://esp.ecobbina.work/guestbook</loc><changefreq>daily</changefreq><priority>0.8</priority></url>\n"
             "  <url><loc>https://esp.ecobbina.work/history</loc><changefreq>weekly</changefreq><priority>0.6</priority></url>\n"
             "  <url><loc>https://esp.ecobbina.work/console</loc><changefreq>always</changefreq><priority>0.5</priority></url>\n"
+            "  <url><loc>https://esp.ecobbina.work/adsb</loc><changefreq>always</changefreq><priority>0.6</priority></url>\n"
             "  <url><loc>https://esp.ecobbina.work/about</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>\n"
             "  <url><loc>https://esp.ecobbina.work/changelog.rss</loc><changefreq>monthly</changefreq><priority>0.4</priority></url>\n"
             "  <url><loc>https://esp.ecobbina.work/guestbook.rss</loc><changefreq>daily</changefreq><priority>0.4</priority></url>\n"
@@ -4435,6 +4855,10 @@ void setup() {
             rss += text;
             rss += "</description></item>";
         };
+        item("Aug 6, 2026", "Thu, 06 Aug 2026 09:00:00 GMT",
+             "Live ADS-B aircraft tracking via the local piaware receiver: new /adsb page with an interactive map and flight table, plus a tracking strip on the homepage. The ESP polls the receiver every 5s, filters to the planes being tracked, and streams compact updates to every viewer through the same SSE pipeline as the sensor stats.");
+        item("Aug 5, 2026", "Wed, 05 Aug 2026 12:00:00 GMT",
+             "Dropped the SD card. The board has no SD slot, so all storage now lives in the 4MB on-chip flash: config, web assets, logs, stats, guestbook, and history sit in a LittleFS partition (2MB app + 1.875MB filesystem). Done by shimming the existing SD.* file calls to flash (fs::LittleFSFS SD), so none of the storage code had to change; web assets are served pre-gzipped to keep everything inside the partition.");
         item("Aug 4, 2026", "Tue, 04 Aug 2026 13:00:00 GMT",
              "Tried moving the project to a T-Display Keyboard board. Its GPIO 21/22 are wired to the keyboard rows, so the stock ESP32 I2C pins aren't free. Workaround: I2C now runs on configurable pins (I2C_SDA/I2C_SCL) and the bus-recovery routine manually clocks the configured SCL pin instead of Arduino's default SDA/SCL macros, so it can't drive the keyboard rows.");
         item("Aug 4, 2026", "Tue, 04 Aug 2026 12:00:00 GMT",
@@ -4796,6 +5220,9 @@ void setup() {
                 File yearDir = root.openNextFile();
                 if (!yearDir) break;
                 if (yearDir.isDirectory()) {
+                    String dirName = String(yearDir.name());
+                    int lastSlash = dirName.lastIndexOf('/');
+                    if (lastSlash >= 0) dirName = dirName.substring(lastSlash + 1);
                     while (true) {
                         File f = yearDir.openNextFile();
                         if (!f) break;
@@ -6331,6 +6758,20 @@ void setup() {
             json += "\"shelly_year_wh\":"     + String((float)year_energy_wh, 2)     + ",";
             json += "\"shelly_lifetime_wh\":" + String((float)lifetime_energy_wh, 2) + ",";
             json += "\"shelly_cost_per_kwh\":" + String(cfgCostPerKwh, 4) + ",";
+            // ADS-B observability. Always emit so the frontend can branch on
+            // adsb_configured; hidden in the UI when not configured.
+            unsigned long adsbNow = millis();
+            long adsbOkAgo  = (lastAdsbGoodAt > 0)
+                ? (long)((adsbNow - lastAdsbGoodAt) / 1000) : -1;
+            long adsbAttAgo = (lastAdsbAttemptMs > 0)
+                ? (long)((adsbNow - lastAdsbAttemptMs) / 1000) : -1;
+            json += "\"adsb_configured\":" + String(cfgAdsbUrl[0] != '\0' ? "true" : "false") + ",";
+            json += "\"adsb_enabled\":" + String(cfgAdsbUrl[0] != '\0' ? "true" : "false") + ",";
+            json += "\"adsb_tracking\":" + String(adsbTrackCount > 0 ? "true" : "false") + ",";
+            json += "\"adsb_count\":" + String(adsbCount) + ",";
+            json += "\"adsb_last_ok_seconds_ago\":" + String(adsbOkAgo) + ",";
+            json += "\"adsb_last_attempt_seconds_ago\":" + String(adsbAttAgo) + ",";
+            json += "\"adsb_last_http_status\":" + String(lastAdsbHttpStatus) + ",";
             // Maintenance state for the admin UI. Worker DO is authoritative.
             time_t nowSec = time(nullptr);
             bool maintActive = (localMaintenanceUntilUnix > 0 && nowSec > 0 && (uint32_t)nowSec < localMaintenanceUntilUnix);
@@ -6523,6 +6964,28 @@ void setup() {
                         detail += ", " + String((float)cached_power_w, 1) + " W";
                     }
                     addTest("Shelly", "pass", detail);
+                }
+            }
+
+            // 4c. ADS-B receiver. Same pass/warn/fail bands. "Not configured"
+            // is a warn, not a fail: the feature is optional by design.
+            if (cfgAdsbUrl[0] == '\0') {
+                addTest("ADS-B", "warn", "not configured");
+            } else if (lastAdsbGoodAt == 0) {
+                addTest("ADS-B", "fail", "never reached (check adsb_url + piaware web interface)");
+            } else {
+                unsigned long ageMs = millis() - lastAdsbGoodAt;
+                if (ageMs >= (unsigned long)cfgAdsbPollMs * 6) {
+                    addTest("ADS-B", "fail",
+                        "no successful poll in " + String(ageMs / 1000) + "s; " +
+                        "last HTTP status " + String(lastAdsbHttpStatus));
+                } else {
+                    String detail = "polling OK, " + String(adsbCount) + " aircraft";
+                    if (adsbTrackCount > 0) {
+                        detail += ", " + String(adsbTrackCount) + " tracked hex";
+                        if (adsbTrackCount > 1) detail += "es";
+                    }
+                    addTest("ADS-B", "pass", detail);
                 }
             }
 
@@ -8006,6 +8469,28 @@ void loop() {
         wsSendText(wsClient, msg);
     }
 
+    // ADS-B push: compact fleet snapshot (only filtered aircraft) whenever it
+    // changed since the last push, or every 15s to keep timestamps fresh.
+    // Min 2.5s spacing so a fast-changing sky can't spam the socket. The
+    // payload is a few KB at most, well under the Worker's 64KB SSE cap.
+    static unsigned long lastAdsbPushMs = 0;
+    static String lastAdsbPushJson;
+    if (!busyWithUpload && wsConnected && wsClient.connected()
+        && cfgAdsbUrl[0] != '\0' && (adsbDirty || lastAdsbGoodAt > 0)
+        && (millis() - lastAdsbPushMs > 2500UL)) {
+        if (adsbDirty || lastAdsbPushMs == 0 || millis() - lastAdsbPushMs > 15000UL) {
+            lastAdsbPushMs = millis();
+            String body = serializeAdsbJson();
+            if (body != lastAdsbPushJson) {
+                lastAdsbPushJson = body;
+                String msg  = "{\"type\":\"event\",\"event\":\"adsb_update\",\"data\":";
+                msg += body;
+                msg += "}";
+                wsSendText(wsClient, msg);
+            }
+        }
+    }
+
     // event-driven /console push: fires the instant a tracked request lands.
     if (pendingConsolePush) {
         pendingConsolePush = false;
@@ -8049,6 +8534,16 @@ void loop() {
         && millis() - lastShellyPollMs > SHELLY_POLL_INTERVAL_MS) {
         lastShellyPollMs = millis();
         pollShelly();
+    }
+
+    // ADS-B poll. Same gating as Shelly: skip during uploads and while the
+    // WS handshake window is open so the synchronous HTTPClient read can't
+    // starve async_tcp. Default 5s cadence matches piaware's own refresh.
+    static unsigned long lastAdsbPollMs = 0;
+    if (cfgAdsbUrl[0] != '\0' && !busyWithUpload && wsQuiet
+        && millis() - lastAdsbPollMs > (unsigned long)cfgAdsbPollMs) {
+        lastAdsbPollMs = millis();
+        pollAdsb();
     }
 
     // Midnight rollover for today_energy_wh. Detects local-date change
@@ -8320,6 +8815,16 @@ void loop() {
                             msg += body;
                             msg += "}";
                             wsSendText(wsClient, msg);
+                            // Same rationale for ADS-B: replay the fleet right
+                            // after connect so a fresh Worker DO has data
+                            // before the next 5s poll cycle.
+                            if (cfgAdsbUrl[0] != '\0' && adsbCount > 0) {
+                                String abody = serializeAdsbJson();
+                                String amsg  = "{\"type\":\"event\",\"event\":\"adsb_update\",\"data\":";
+                                amsg += abody;
+                                amsg += "}";
+                                wsSendText(wsClient, amsg);
+                            }
                         }
                     } else {
                         wsReconnectFails++;

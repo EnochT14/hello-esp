@@ -833,6 +833,7 @@
             <li><a href="/guestbook">Guestbook</a></li>
             <li><a href="/history">History</a></li>
             <li><a href="/console">Console</a></li>
+            <li><a href="/adsb">Aircraft</a></li>
             <li><a href="/about">About</a></li>
         </ul>
     </nav>
@@ -921,6 +922,11 @@
             <div class="stat-value loading" id="dumsor_total"></div>
             <div class="stat-sub" id="dumsor_sub"></div>
         </div>
+        <div class="stat stat-wide" id="adsb-card" style="display:none;">
+            <div class="stat-label"><a href="/adsb" style="color:inherit;text-decoration:none;"><i class="fa-solid fa-plane"></i> Aircraft tracking</a></div>
+            <div class="stat-value loading" id="adsb_count"></div>
+            <div class="stat-sub" id="adsb_sub"></div>
+        </div>
         <div class="stat stat-wide">
             <div class="stat-label"><i class="fa-solid fa-clock-rotate-left"></i> Last updated <span class="live-dot stale" id="live-dot" role="status" aria-label="connection: stale"></span> <span id="live-label">stale</span></div>
             <div class="stat-value" id="last_updated" style="font-size:14px;color:var(--mid);" aria-live="polite" aria-atomic="true">...</div>
@@ -928,7 +934,7 @@
     </div>
 
     <p style="font-size:11px;color:var(--mid);margin:-40px 0 24px;opacity:0.7;">
-        <i class="fa-solid fa-circle-info" style="margin-right:6px;"></i>Sensors are inside a sealed frame, so readings reflect the enclosure, not the room.
+        <i class="fa-solid fa-circle-info" style="margin-right:6px;"></i>Sensors readings reflect the indoor environment.
     </p>
 
     <section class="outdoor" id="outdoor-section" style="display:none;">
@@ -1040,6 +1046,14 @@
     <div class="log">
         <div class="section-label"><i class="fa-solid fa-list"></i> Changelog <a class="section-rss" href="/changelog.rss" aria-label="Subscribe to changelog via RSS" title="Subscribe via RSS"><i class="fa-solid fa-rss"></i></a></div>
         <div class="log-entry">
+            <div class="log-date">Aug 6, 2026</div>
+            <div class="log-text">Live ADS-B aircraft tracking via the local piaware receiver: new <a href="/adsb">/adsb</a> page with an interactive map and flight table, plus a tracking strip on the homepage. The ESP polls the receiver every 5s, filters to the planes being tracked, and streams compact updates to every viewer through the same SSE pipeline as the sensor stats.</div>
+        </div>
+        <div class="log-entry">
+            <div class="log-date">Aug 5, 2026</div>
+            <div class="log-text">Dropped the SD card. The board has no SD slot, so all storage now lives in the 4MB on-chip flash: config, web assets, logs, stats, guestbook, and history sit in a LittleFS partition (2MB app + 1.875MB filesystem). Done by shimming the existing SD.* file calls to flash (<code>fs::LittleFSFS SD</code>), so none of the storage code had to change; web assets are served pre-gzipped to keep everything inside the partition.</div>
+        </div>
+        <div class="log-entry">
             <div class="log-date">Aug 4, 2026</div>
             <div class="log-text">Tried moving the project to a T-Display Keyboard board. Its GPIO 21/22 are wired to the keyboard rows, so the stock ESP32 I2C pins aren't free. Workaround: I2C now runs on configurable pins (I2C_SDA/I2C_SCL) and the bus-recovery routine manually clocks the configured SCL pin instead of Arduino's default SDA/SCL macros, so it can't drive the keyboard rows.</div>
         </div>
@@ -1060,6 +1074,7 @@
         <li><a href="/guestbook"><i class="fa-solid fa-pen"></i> Guestbook</a></li>
         <li><a href="/history"><i class="fa-solid fa-clock-rotate-left"></i> History</a></li>
         <li><a href="/console"><i class="fa-solid fa-terminal"></i> Console</a></li>
+        <li><a href="/adsb"><i class="fa-solid fa-plane"></i> Aircraft</a></li>
         <li><a href="/about"><i class="fa-solid fa-circle-info"></i> About</a></li>
         <li><a href="https://github.com/EnochT14/hello-esp" target="_blank" rel="noopener"><i class="fa-brands fa-github"></i> GitHub</a></li>
     </ul>
@@ -1695,6 +1710,10 @@
                 try { tickerEntry = JSON.parse(e.data); renderTicker(); }
                 catch(err) {}
             });
+            sse.addEventListener('adsb', function(e) {
+                try { applyAdsb(JSON.parse(e.data)); }
+                catch(err) {}
+            });
             sse.onerror = function() {
                 // Close to break the auto-retry loop, then poll.
                 if (sse) { try { sse.close(); } catch (e) {} sse = null; }
@@ -1706,6 +1725,34 @@
         } catch(e) { startPolling(); }
     }
     startSse();
+
+    // Aircraft strip: live via SSE when online, one-shot /adsb.json when LAN.
+    // Stale-hide timer so a receiver outage doesn't leave an old count on show.
+    var lastAdsbAt = 0, adsbHideTimer = null;
+    function applyAdsb(d) {
+        var card = document.getElementById('adsb-card');
+        if (!card || !d || !Array.isArray(d.aircraft)) return;
+        lastAdsbAt = Date.now();
+        card.style.display = '';
+        var countEl = document.getElementById('adsb_count');
+        countEl.classList.remove('loading');
+        countEl.textContent = d.aircraft.length;
+        var hi = null, i, a;
+        for (i = 0; i < d.aircraft.length; i++) {
+            a = d.aircraft[i];
+            if (a && typeof a.alt === 'number' && (hi === null || a.alt > hi)) hi = a.alt;
+        }
+        document.getElementById('adsb_sub').textContent =
+            'Now tracking over your receiver' + (hi !== null ? ' · highest at ' + hi + ' ft' : '');
+        if (adsbHideTimer) { clearTimeout(adsbHideTimer); adsbHideTimer = null; }
+        adsbHideTimer = setTimeout(function() { card.style.display = 'none'; }, 20000);
+    }
+    try {
+        fetch('/adsb.json', { headers: { 'Accept': 'application/json' } })
+            .then(function(r) { if (!r.ok) throw 0; return r.json(); })
+            .then(function(d) { applyAdsb(d); })
+            .catch(function() {});
+    } catch (e) {}
 
     // safety net: if SSE hasn't produced data within 8s, start polling
     setTimeout(function() {

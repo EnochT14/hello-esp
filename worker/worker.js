@@ -147,6 +147,8 @@ export class EspRelay {
     this.sseClients = new Set();
     this.lastStats = null;  // JSON string of the most recent ESP stats push
     this.lastStatsAt = 0;   // epoch ms when lastStats was set; used to detect staleness for badges
+    this.lastAdsb = null;   // JSON string of the most recent ADS-B fleet push
+    this.lastAdsbAt = 0;    // epoch ms when lastAdsb was set
     this.lastWeather = null; // cached outdoor weather object
     this.lastAirQuality = null; // cached outdoor air-quality object (PM2.5, US AQI)
     this.deadmanAlertSent = false; // so we don't spam when offline persists past 24h
@@ -775,6 +777,17 @@ export class EspRelay {
       }
       if (msg.event === 'console_update') {
         if (msg.data) this.broadcastEvent('console', JSON.stringify(msg.data));
+        return;
+      }
+      if (msg.event === 'adsb_update') {
+        if (msg.data) {
+          // Cache the latest fleet so a fresh SSE viewer gets instant data
+          // (same replay-on-connect pattern as lastStats). RAM only; the
+          // fleet is inherently transient and self-healing from the ESP.
+          this.lastAdsb = JSON.stringify(msg.data);
+          this.lastAdsbAt = Date.now();
+          this.broadcastEvent('adsb', JSON.stringify(msg.data));
+        }
         return;
       }
       if (msg.event && msg.event.startsWith('backup_')) {
@@ -1823,6 +1836,15 @@ export class EspRelay {
           this.sseClients.delete(writer);
           writer.abort().catch(() => {});
         });
+      }
+      // Replay the last ADS-B fleet so the /adsb page and homepage strip
+      // render instantly instead of waiting up to 5s for the next push.
+      if (this.lastAdsb) {
+        const payload = new TextEncoder().encode(`event: adsb\ndata: ${this.lastAdsb}\n\n`);
+        writer.write(payload).catch(() => {
+          this.sseClients.delete(writer);
+          writer.abort().catch(() => {});
+        });
       } else {
         // send a zero-length comment so the connection is established promptly
         writer.write(new TextEncoder().encode(': connected\n\n')).catch(() => {
@@ -2203,6 +2225,7 @@ const NO_CACHE_PREFIX = ['/logs', '/admin', '/_ws', '/_stream',
   '/guestbook/replies', '/guestbook/locate'];
 // Exact matches: prefix would over-match (e.g. /guestbook/translate).
 const NO_CACHE_EXACT = new Set(['/console.json',
+  '/adsb.json',
   '/guestbook/translate']);
 
 // Static page shells that the chip serves with a short Cache-Control. Bumping
@@ -2214,7 +2237,7 @@ const NO_CACHE_EXACT = new Set(['/console.json',
 // firmware/data deploys, so an hour of edge staleness is an acceptable
 // trade for the 90%+ reduction in relay-bound traffic.
 const STATIC_SHELL_PATHS = new Set([
-  '/about', '/history', '/console', '/guestbook',
+  '/about', '/history', '/console', '/guestbook', '/adsb',
   '/404.html', '/offline.html', '/timeout.html',
 ]);
 const SHELL_EDGE_TTL = 3600;  // 1 hour CF edge cache for shells

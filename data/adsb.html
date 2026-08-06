@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Aircraft / HelloESP</title>
+    <meta name="description" content="Live ADS-B aircraft tracking from the local piaware receiver: current position, callsign, altitude, speed, and heading of every plane being tracked.">
+    <meta name="author" content="EnochT14">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#2686e6">
+    <meta property="og:title" content="Aircraft / HelloESP">
+    <meta property="og:site_name" content="HelloESP">
+    <meta property="og:description" content="Live ADS-B aircraft tracking from the local piaware receiver.">
+    <meta property="og:image" content="https://esp.ecobbina.work/og-banner.jpg">
+    <meta property="og:image:type" content="image/jpeg">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="HelloESP: a website running on an ESP32">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://esp.ecobbina.work/adsb">
+    <link rel="canonical" href="https://esp.ecobbina.work/adsb">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="icon" type="image/png" href="/favicon.png">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
+          integrity="sha384-/o6I2CkkWC//PSjvWC/eYN7l3xM3tJm8ZzVkCOfp//W05QcE3mlGskpoHB6XqI+B"
+          crossorigin="anonymous" referrerpolicy="no-referrer"
+          media="print" onload="this.media='all'">
+    <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
+          integrity="sha384-/o6I2CkkWC//PSjvWC/eYN7l3xM3tJm8ZzVkCOfp//W05QcE3mlGskpoHB6XqI+B"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></noscript>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"
+          integrity="sha512-h9FcoyWjHcOcmEVkxOfTLnmZFWIH0iZhZT1H2TbOq55xssQGEJHEaIm+PgoUaZbRvQTNTluNOEfb1ZRy6D3BOw=="
+          crossorigin="anonymous" referrerpolicy="no-referrer">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #f8f7f4;
+            --ink: #1a1a1a;
+            --mid: #888;
+            --faint: #ccc;
+            --ok: #0a8b4a;
+            --warn: #c06b00;
+            --err: #b02030;
+        }
+
+        body {
+            background: var(--bg);
+            color: var(--ink);
+            font-family: ui-monospace, "SF Mono", "Cascadia Mono", "Consolas", monospace;
+            min-height: 100vh;
+            display: grid;
+            grid-template-rows: 1fr auto;
+        }
+
+        a:focus-visible,
+        button:focus-visible {
+            outline: 2px solid var(--ink);
+            outline-offset: 2px;
+            border-radius: 2px;
+        }
+
+        main {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 80px 24px 64px;
+            width: 100%;
+        }
+
+        .top-nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            row-gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 24px;
+        }
+        @media (max-width: 480px) {
+            .top-links { gap: 14px; font-size: 10px; }
+        }
+        .site-name {
+            font-size: 13px;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--mid);
+            text-decoration: none;
+            transition: color 0.15s;
+        }
+        .site-name:hover { color: var(--ink); }
+        .top-links {
+            display: flex;
+            gap: 16px;
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            font-size: 11px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+        .top-links a {
+            color: var(--mid);
+            text-decoration: none;
+            transition: color 0.15s;
+        }
+        .top-links a:hover { color: var(--ink); }
+        .top-links a.current { color: var(--ink); }
+
+        h1 {
+            font-size: clamp(28px, 5vw, 42px);
+            font-weight: 400;
+            letter-spacing: -0.02em;
+            line-height: 1.1;
+            margin-bottom: 16px;
+        }
+
+        .desc {
+            font-size: 13px;
+            line-height: 1.8;
+            color: var(--mid);
+            margin-bottom: 24px;
+            max-width: 640px;
+        }
+
+        .indicator {
+            font-size: 11px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--mid);
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--mid);
+            animation: pulse 1.4s ease-in-out infinite;
+        }
+        .dot.ok { background: var(--ok); animation: none; }
+        .dot.err { background: var(--err); animation: none; }
+        @keyframes pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+        @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
+
+        .map-wrap {
+            border: 1px solid var(--faint);
+            border-radius: 6px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            background: #e8e4dd;
+        }
+        #map { height: 420px; width: 100%; }
+        @media (max-width: 640px) { #map { height: 320px; } }
+
+        .table-wrap {
+            overflow-x: auto;
+            border: 1px solid var(--faint);
+            border-radius: 6px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        th {
+            text-align: left;
+            font-size: 10px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--mid);
+            font-weight: 400;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--faint);
+            white-space: nowrap;
+        }
+        td {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--faint);
+            white-space: nowrap;
+        }
+        tr:last-child td { border-bottom: none; }
+        td.hex { color: var(--mid); }
+        td.flight { font-weight: 600; }
+        td.alt {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+        td.alt.alt-ground { color: var(--mid); }
+        td.metric { text-align: right; font-variant-numeric: tabular-nums; }
+        .empty {
+            text-align: center;
+            color: var(--mid);
+            font-size: 12px;
+            padding: 40px 16px;
+        }
+
+        .plane-icon {
+            width: 24px;
+            height: 24px;
+            display: block;
+            transition: transform 0.3s linear;
+        }
+
+        .popup-title { font-weight: 600; font-size: 13px; }
+        .popup-meta { font-size: 11px; color: var(--mid); margin-top: 4px; line-height: 1.6; }
+        a.track-link {
+            color: var(--link, #2686e6);
+            text-decoration: none;
+            border-bottom: 1px dotted var(--mid);
+        }
+        a.track-link:hover { text-decoration: underline; }
+        .popup-meta a { color: var(--link, #2686e6); }
+
+        footer {
+            border-top: 1px solid var(--faint);
+            padding: 28px 24px 32px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 14px;
+        }
+        .footer-meta {
+            font-size: 11px;
+            color: var(--mid);
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .footer-meta a { color: var(--mid); }
+        .footer-links {
+            list-style: none;
+            display: flex;
+            gap: 18px;
+            flex-wrap: wrap;
+            justify-content: center;
+            font-size: 11px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+        .footer-links a { color: var(--mid); text-decoration: none; }
+        .footer-links a:hover { color: var(--ink); }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #111110;
+                --ink: #e8e6e1;
+                --mid: #8a8a87;
+                --faint: #2a2a28;
+            }
+            .map-wrap { background: #1a1918; }
+            th, td { border-color: var(--faint); }
+        }
+    </style>
+</head>
+<body>
+
+<main>
+    <nav class="top-nav" aria-label="Primary">
+        <a class="site-name" href="/"><img src="/favicon.png" alt="" style="height:14px;vertical-align:-1px;margin-right:4px;">HelloESP</a>
+        <ul class="top-links">
+            <li><a href="/guestbook">Guestbook</a></li>
+            <li><a href="/history">History</a></li>
+            <li><a href="/console">Console</a></li>
+            <li><a href="/about">About</a></li>
+        </ul>
+    </nav>
+
+    <h1>Aircraft</h1>
+
+    <p class="desc">
+        Live ADS-B feed from the local piaware receiver, relayed through the ESP32.
+        Every few seconds the chip pulls the receiver's snapshot, filters it down to
+        the planes being tracked, and streams it here. Planes with no recent position
+        disappear automatically.
+    </p>
+
+    <div class="indicator" role="status"><span class="dot" id="status-dot"></span><span id="status-text">Connecting...</span></div>
+
+    <div class="map-wrap"><div id="map"></div></div>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Hex</th>
+                    <th>Callsign</th>
+                    <th>Altitude</th>
+                    <th>Speed</th>
+                    <th>Heading</th>
+                    <th>Squawk</th>
+                    <th>Type</th>
+                    <th>Last msg</th>
+                </tr>
+            </thead>
+            <tbody id="fleet-body"><tr><td colspan="8"><div class="empty" id="fleet-empty">No aircraft in range.</div></td></tr></tbody>
+        </table>
+    </div>
+</main>
+
+<footer>
+    <div class="footer-meta">
+        <span>ADS-B via <a href="https://flightaware.com/adsb/piaware/" target="_blank" rel="noopener">PiAware</a> on the local network</span>
+        <span class="served" id="served-time"></span>
+    </div>
+    <ul class="footer-links">
+        <li><a href="/"><i class="fa-solid fa-house"></i> Home</a></li>
+        <li><a href="/guestbook"><i class="fa-solid fa-pen"></i> Guestbook</a></li>
+        <li><a href="/history"><i class="fa-solid fa-clock-rotate-left"></i> History</a></li>
+        <li><a href="/console"><i class="fa-solid fa-terminal"></i> Console</a></li>
+        <li><a href="/about"><i class="fa-solid fa-circle-info"></i> About</a></li>
+        <li><a href="https://github.com/EnochT14/hello-esp" target="_blank" rel="noopener"><i class="fa-brands fa-github"></i> GitHub</a></li>
+    </ul>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"
+        integrity="sha512-puJW3E/qXDqYp9IfhAI54BJEaWIfloJ7JWs7OeD5i6ruC9JZL1gERT1wjtwXFlh7CjE7ZJ+/vcRZRkIYIb6p4g=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>
+    function esc(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    var map = L.map('map').setView([38.5, -105.2], 6);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 18,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    // Symmetric plane silhouette pointing straight up (nose at 12,2). CSS
+    // rotate() spins it clockwise, matching aviation track bearing: 0=up
+    // (north), 90=east, 180=south, 270=west. The old diagonal glyph made
+    // every arrow read as flying at 45 degrees off its true heading.
+    var PLANE_PATH = '<path d="M12 2 L14.7 9.7 L22.3 12.2 L22.3 14 L14.7 12.2 L14.5 16.8 L16.9 19.3 L16.9 21.3 L12 20.3 L7.1 21.3 L7.1 19.3 L9.5 16.8 L9.3 12.2 L1.7 14 L1.7 12.2 L9.3 9.7 Z" ' +
+        'fill="#2686e6" stroke="#ffffff" stroke-width="0.8"/>';
+
+    // Landing page for the flight on a global ADS-B aggregator. ?icao centers
+    // and isolates the aircraft on the map. Hex is server-sanitized so it is
+    // always [0-9A-F]{6} by the time it reaches this code.
+    function trackUrl(hex) {
+        return 'https://globe.adsbexchange.com/?icao=' + String(hex).toLowerCase();
+    }
+
+    function planeIcon(a) {
+        var rot = (typeof a.trk === 'number') ? 'rotate(' + a.trk + 'deg)' : '';
+        var svg = '<svg class="plane-icon" style="transform:' + rot + '" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
+            PLANE_PATH + '</svg>';
+        return L.divIcon({
+            html: svg,
+            className: '',
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+        });
+    }
+
+    function altText(a) {
+        if (typeof a.alt !== 'number') return '-';
+        if (a.alt === 0) return 'GND';
+        return a.alt.toLocaleString('en-US') + ' ft';
+    }
+
+    function popupHtml(a) {
+        var html = '<div class="popup-title">' + esc(a.f || a.hex) + '</div>';
+        html += '<div class="popup-meta">' + esc(a.hex).toUpperCase() +
+            (a.sq ? ' &middot; sq ' + esc(a.sq) : '') +
+            (a.cat ? ' &middot; ' + esc(a.cat) : '') + '<br>' +
+            altText(a) +
+            (typeof a.gs === 'number' ? ' &middot; ' + Math.round(a.gs) + ' kt' : '') +
+            (typeof a.trk === 'number' ? ' &middot; ' + Math.round(a.trk) + '&deg;' : '') + '</div>';
+        html += '<div class="popup-meta"><a href="' + trackUrl(a.hex) +
+            '" target="_blank" rel="noopener noreferrer">Track on ADSB Exchange</a></div>';
+        return html;
+    }
+
+    var markers = {};   // hex -> Leaflet marker
+    var fittedFor = 0;  // marker count we last fitBounds to
+
+    function removeMarker(hex) {
+        var m = markers[hex];
+        if (!m) return;
+        map.removeLayer(m);
+        delete markers[hex];
+    }
+
+    function renderFleet(d) {
+        if (!d || !Array.isArray(d.aircraft)) return;
+        var seen = new Set();
+        var i, a;
+        for (i = 0; i < d.aircraft.length; i++) {
+            a = d.aircraft[i];
+            if (!a || !a.hex) continue;
+            seen.add(a.hex);
+            if (a.seen > 120 || typeof a.lat !== 'number' || typeof a.lon !== 'number') {
+                removeMarker(a.hex);
+                continue;
+            }
+            var m = markers[a.hex];
+            if (m) {
+                m.setLatLng([a.lat, a.lon]);
+                m.setIcon(planeIcon(a));
+            } else {
+                m = L.marker([a.lat, a.lon], { icon: planeIcon(a) }).addTo(map);
+                m.bindPopup(popupHtml(a));
+                markers[a.hex] = m;
+            }
+        }
+        // Drop markers whose plane vanished from the snapshot.
+        for (var hex in markers) {
+            if (!seen.has(hex)) removeMarker(hex);
+        }
+        // Auto-fit only when the fleet grew; don't yank the view every 5s.
+        var count = Object.keys(markers).length;
+        if (count > fittedFor) {
+            fittedFor = count;
+            var bounds = [];
+            for (var k in markers) bounds.push(markers[k].getLatLng());
+            if (bounds.length) map.fitBounds(L.latLngBounds(bounds), { padding: [40, 40] });
+        }
+
+        renderTable(d.aircraft, seen);
+    }
+
+    function renderTable(aircraft, seen) {
+        var tbody = document.getElementById('fleet-body');
+        if (!aircraft.length) {
+            tbody.innerHTML = '<tr><td colspan="8"><div class="empty">No aircraft in range.</div></td></tr>';
+            return;
+        }
+        var rows = aircraft.filter(function(a) { return a && seen.has(a.hex); });
+        rows.sort(function(x, y) { return (x.f || '').localeCompare(y.f || ''); });
+        var html = '';
+        for (var i = 0; i < rows.length; i++) {
+            var a = rows[i];
+            var onGround = (a.alt === 0);
+            html += '<tr>';
+            html += '<td class="hex">' + esc(a.hex).toUpperCase() + '</td>';
+            html += '<td class="flight"><a class="track-link" href="' + trackUrl(a.hex) +
+                '" target="_blank" rel="noopener noreferrer" title="Track ' +
+                esc(a.f || a.hex).toUpperCase() + ' on ADSB Exchange">' +
+                esc(a.f || a.hex) + '</a></td>';
+            html += '<td class="alt' + (onGround ? ' alt-ground' : '') + '">' + altText(a) + '</td>';
+            html += '<td class="metric">' + (typeof a.gs === 'number' ? Math.round(a.gs) + ' kt' : '-') + '</td>';
+            html += '<td class="metric">' + (typeof a.trk === 'number' ? Math.round(a.trk) + '&deg;' : '-') + '</td>';
+            html += '<td>' + (a.sq ? esc(a.sq) : '-') + '</td>';
+            html += '<td>' + (a.cat ? esc(a.cat) : '-') + '</td>';
+            html += '<td class="metric">' + (typeof a.seen === 'number' ? a.seen + 's' : '-') + '</td>';
+            html += '</tr>';
+        }
+        tbody.innerHTML = html;
+    }
+
+    var statusDot = document.getElementById('status-dot');
+    var statusText = document.getElementById('status-text');
+    var nowUnix = 0;
+
+    function setStatus(cls, text) {
+        statusDot.className = 'dot' + (cls ? ' ' + cls : '');
+        statusText.textContent = text;
+    }
+
+    function applyData(d) {
+        if (d && typeof d.now === 'number') nowUnix = d.now;
+        renderFleet(d);
+        var ago = nowUnix ? Math.max(0, Math.floor(Date.now() / 1000) - nowUnix) : 0;
+        setStatus('ok', Object.keys(markers).length + ' aircraft · receiver live · updated ' + ago + 's ago');
+    }
+
+    // SSE is served by the Cloudflare Worker; on LAN (direct IP) /_stream
+    // has no handler, so fall through to polling /adsb.json, which the ESP
+    // serves directly from its cached fleet.
+    var onWorkerHost = /esp\.ecobbina\.work$/i.test(location.hostname) || /\.workers\.dev$/i.test(location.hostname);
+    var sse = null;
+    var lastSseEventAt = 0;
+    var safetyNet = null;
+    var poll = null;
+
+    function sseHealthy() { return !!sse && sse.readyState === 1 && lastSseEventAt > 0; }
+
+    function fetchFleet() {
+        fetch('/adsb.json', { cache: 'no-store' })
+            .then(function(r) { return r.ok ? r.json() : null; })
+            .then(function(d) {
+                if (d && Array.isArray(d.aircraft)) applyData(d);
+            })
+            .catch(function() {});
+    }
+
+    function startPolling() {
+        if (!poll) {
+            poll = setInterval(fetchFleet, 5000);
+            setStatus('', 'Polling for updates...');
+        }
+    }
+    function stopPolling() { if (poll) { clearInterval(poll); poll = null; } }
+
+    function armSafetyNet() {
+        if (safetyNet) clearTimeout(safetyNet);
+        safetyNet = setTimeout(function() {
+            safetyNet = null;
+            if (!sseHealthy()) startPolling();
+        }, 8000);
+    }
+
+    function openSSE() {
+        if (!onWorkerHost || typeof EventSource === 'undefined') { startPolling(); return; }
+        try {
+            sse = new EventSource('/_stream');
+            sse.addEventListener('adsb', function(e) {
+                lastSseEventAt = Date.now();
+                if (safetyNet) { clearTimeout(safetyNet); safetyNet = null; }
+                try { applyData(JSON.parse(e.data)); stopPolling(); } catch (err) {}
+            });
+            sse.onerror = function() {
+                setStatus('', 'Reconnecting');
+                startPolling();
+            };
+        } catch (e) { startPolling(); }
+    }
+
+    fetchFleet();
+    openSSE();
+    armSafetyNet();
+
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            stopPolling();
+            if (sse) { try { sse.close(); } catch (e) {} sse = null; }
+            if (safetyNet) { clearTimeout(safetyNet); safetyNet = null; }
+            lastSseEventAt = 0;
+        } else {
+            fetchFleet();
+            if (!sse) { openSSE(); armSafetyNet(); }
+        }
+    });
+
+    // smooth cross-page navigation when supported
+    if (document.startViewTransition) {
+        document.addEventListener('click', function(e) {
+            var a = e.target.closest('a[href^="/"]');
+            if (!a) return;
+            if (a.target || a.hasAttribute('download')) return;
+            if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            var href = a.getAttribute('href');
+            if (!href || href.startsWith('//') || href.startsWith('#')) return;
+            e.preventDefault();
+            document.startViewTransition(function() { location.href = href; });
+        });
+    }
+
+    window.addEventListener('load', function() {
+        try {
+            var nav = performance.getEntriesByType('navigation')[0];
+            if (!nav) return;
+            var ms = Math.round(nav.responseEnd - nav.requestStart);
+            var msValid = (ms >= 0 && ms <= 60000);
+            var totalBytes = nav.transferSize || nav.encodedBodySize || 0;
+            performance.getEntriesByType('resource').forEach(function(r) {
+                totalBytes += r.transferSize || r.encodedBodySize || 0;
+            });
+            var kb = totalBytes > 0 ? Math.round(totalBytes / 1024) + ' KB' : '';
+            var label = '';
+            if (kb && msValid)      label = kb + ' in ' + ms + ' ms';
+            else if (kb)            label = kb;
+            else if (msValid)       label = 'served in ' + ms + ' ms';
+            var el = document.getElementById('served-time');
+            if (el && label) el.textContent = label;
+        } catch (e) {}
+    });
+</script>
+
+</body>
+</html>

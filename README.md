@@ -116,6 +116,7 @@ after the clock syncs.
 - Optional SMTP2GO integration for guestbook-pending alerts, dead-man's-switch (device silent >N hours), backup failures, and overdue-backup warnings
 - Optional daily off-site backups to Cloudflare R2 with GFS rotation (7 daily + 4 weekly + 12 monthly + yearly) and sha256 integrity manifests; Worker also writes a daily full Durable Object snapshot to `state/do-snapshot/YYYY-MM-DD.json` (30-day retention) so DO state (translation caches, moderation queues) is recoverable independently if DO is ever wiped
 - Optional Shelly Gen 2+ smart plug integration: energy column in CSV logs, per-period energy on `/history` cards, admin observability panel + self-test entry (homepage banner/chart were dropped in this build — no plug wired)
+- Optional live ADS-B aircraft tracking: the ESP polls a local piaware/dump1090 receiver (`adsb_url` config), filters tracked aircraft (optional hex list via `adsb_track`, else all position-known in range), and serves `/adsb.json` for LAN viewers while pushing compact `adsb_update` events over the Worker SSE stream. The public `/adsb` page is a Leaflet map + table of live aircraft over the receiver; the homepage shows a count strip. All parsing is a streaming state machine with zero dynamic allocation — stays well within ESP32 RAM even with 60 aircraft. Receiver unreachable? The pages self-hide and the poll self-heals
 - Security headers, no-cache list for dynamic endpoints
 - RSS feeds (`/changelog.rss`, `/guestbook.rss`), `sitemap.xml`, `robots.txt`, `.well-known/security.txt`
 
@@ -205,6 +206,10 @@ timezone=GMT0
 Timezone is a POSIX TZ string. Common examples are listed in the file (for
 Ghana: `GMT0`). Leave `worker_url`, `worker_key`, and `device_key` blank to run
 LAN-only. `dumsor_tracking=true` (the default) enables the power-outage tracker.
+Optional ADS-B tracking: set `adsb_url` to your piaware receiver's aircraft
+JSON feed (e.g. `http://192.168.100.2:8080/data/aircraft.json`), optionally
+`adsb_track` with a space-separated hex list to track only specific aircraft,
+and tune `adsb_poll_ms`/`adsb_max`. Leave `adsb_url` blank to disable.
 
 Optional `worker_exclusive=true` redirects LAN public-page hits (`/`, `/guestbook`, etc.) to the Worker so they go through CF's edge cache. `/admin` always serves direct on LAN. Default off; flip to `true` only if your Worker is set up and you want LAN visitors to share the same cache layer as public visitors.
 
