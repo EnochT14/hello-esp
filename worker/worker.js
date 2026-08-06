@@ -22,7 +22,13 @@ const SEC_HEADERS = {
   'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
-  'Referrer-Policy': 'strict-origin-when-cross-origin'
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  // Allow cross-origin reads (portfolio site embeds live /stats + /adsb.json
+  // data). Public site, no credentials, so `*` is safe; GETs with standard
+  // headers need no preflight.
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Accept'
 };
 
 function applySecHeaders(h) {
