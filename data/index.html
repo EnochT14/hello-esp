@@ -1046,6 +1046,14 @@
     <div class="log">
         <div class="section-label"><i class="fa-solid fa-list"></i> Changelog <a class="section-rss" href="/changelog.rss" aria-label="Subscribe to changelog via RSS" title="Subscribe via RSS"><i class="fa-solid fa-rss"></i></a></div>
         <div class="log-entry">
+            <div class="log-date">Sep 3, 2026</div>
+            <div class="log-text">Fixed a boot-loop caused by a corrupted flash filesystem (crashed on the first file write after Wi-Fi connect) by reflashing firmware and filesystem and restoring state from the R2 backup. Daily R2 backups now also include the last 7 days of sensor logs, and the device prunes logs older than 10 days so the 1.3MB flash partition can't fill up again.</div>
+        </div>
+        <div class="log-entry">
+            <div class="log-date">Aug 26, 2026</div>
+            <div class="log-text">CCS811 reliability fix: a CO2 sensor that latches its internal error flag (after a power glitch or bus disturbance) is now software-reset and re-initialized automatically while the rest of the board keeps running, instead of showing "not responding" until a manual reboot. The error log now also records the chip's own error code (e.g. heater fault, sensing-element max resistance) when a recovery is attempted, and the bus-recovery path no longer masks a dead sensor as healthy.</div>
+        </div>
+        <div class="log-entry">
             <div class="log-date">Aug 6, 2026</div>
             <div class="log-text">Live ADS-B aircraft tracking via the local piaware receiver: new <a href="/adsb">/adsb</a> page with an interactive map and flight table, plus a tracking strip on the homepage. The ESP polls the receiver every 5s, filters to the planes being tracked, and streams compact updates to every viewer through the same SSE pipeline as the sensor stats.</div>
         </div>

@@ -1,0 +1,20 @@
+# 4MB OTA-capable layout: two 1.5MB app slots + 1.875MB... 
+# Two OTA slots (app0/app1) so /_ota and the SD-flash flow can write a
+# non-running image and boot into it. The old layout used the built-in
+# no_ota.csv, which has a SINGLE app partition of subtype ota_0 running
+# from it — esp_ota_get_next_update_partition() then returns the running
+# partition itself, so any OTA self-overwrites the executing firmware and
+# panics mid-upload. This table fixes that (firmware must stay <= 1.5MB;
+# current image is ~1.26MB).
+#
+# Filesystem (spiffs label, LittleFS format) shrinks from 1.875MB to
+# 1.3125MB. On migration, reflash with `pio run -t uploadfs` and restore
+# state from the R2 backup / local backup; keep only recent daily CSVs on
+# the device (old ones were the reason the FS filled and GC storms froze
+# the loop).
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x150000,
+app1,     app,  ota_1,   0x160000, 0x150000,
+spiffs,   data, spiffs,  0x2b0000, 0x150000,

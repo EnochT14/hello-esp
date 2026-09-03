@@ -30,7 +30,7 @@
 SET_LOOP_TASK_STACK_SIZE(12 * 1024);
 
 // Version
-#define FIRMWARE_VERSION "1.4"
+#define FIRMWARE_VERSION "1.5"
 
 // Pins - generic ESP32 WROOM-32 dev board (esp32doit-devkit-v1, 4MB flash)
 // I2C (GME12864-78 OLED + BME280 + CCS811): SDA 21, SCL 22 (stock ESP32 I2C
@@ -3276,10 +3276,48 @@ static void backupSendFile(uint32_t seq, const char* path, const char* name, siz
     wsSendText(wsClient, tail);
 }
 
+// R2 backup coverage for /logs (daily sensor CSVs).
+// The bundle is a FULL snapshot every day with no server-side dedup, so
+// sending the whole /logs history would re-upload everything daily and grow
+// without bound. Instead only the most recent LOG_BACKUP_DAYS daily CSVs go
+// into the bundle; combined with the Worker's 7-daily-snapshot rotation this
+// keeps ~2 weeks of per-day detail recoverable from R2 at any time.
+// Filenames are ISO YYYY-MM-DD.csv so plain string comparison orders them.
+#define LOG_BACKUP_DAYS 7
+// On-device retention for /logs. The LittleFS partition is 1.3MB with ~790KB
+// of web assets, so unbounded CSV growth fills it (the pre-v1.5 outage
+// class: FS full -> GC storms -> loop freezes). Weekly/monthly JSON
+// aggregates in /stats are unaffected by pruning, so long-range charts keep
+// working; only per-day detail older than the window is dropped from the
+// device (still recoverable from R2 snapshots while they rotate).
+#define LOG_RETAIN_DAYS 10
+// YYYY-MM-DD: /logs files >= this are included in the bundle. Computed per
+// backup run in buildAndSendBackup() (empty = no clock, include all).
+char backupLogsCutoff[11] = "";
+
+// Decides whether a /logs file belongs in the R2 bundle. Non-log paths
+// always return true. Only exact "YYYY-MM-DD.csv" names inside the backup
+// window pass; errors.log / errors.log.old / strays stay device-local.
+static bool logFileInBackupWindow(const char* absPath, const char* base) {
+    if (strncmp(absPath, "/logs/", 6) != 0) return true;
+    size_t bl = strlen(base);
+    if (bl != 14 || strcmp(base + 10, ".csv") != 0) return false;
+    for (int i = 0; i < 10; i++) {
+        char c = base[i];
+        if (i == 4 || i == 7) { if (c != '-') return false; }
+        else if (c < '0' || c > '9') return false;
+    }
+    if (backupLogsCutoff[0] == '\0') return true;
+    char fileDate[11];
+    memcpy(fileDate, base, 10);
+    fileDate[10] = '\0';
+    return strcmp(fileDate, backupLogsCutoff) >= 0;
+}
+
 // Exclusion rules for the recursive SD walker. Secrets, transient atomic-write artifacts, and
-// on-device log rotation don't belong in a restore bundle.
+// firmware staging don't belong in a restore bundle. /logs IS walked (gated per-file by
+// logFileInBackupWindow above); /config.txt is excluded but must be kept safe separately.
 static bool backupExcludeDir(const char* absPath) {
-    if (strcmp(absPath, "/logs") == 0)  return true;
     if (strcmp(absPath, "/fw") == 0)    return true;  // firmware staging, not backup-worthy (1-2MB each)
     if (strcmp(absPath, "/System Volume Information") == 0) return true;
     return false;
@@ -3287,6 +3325,7 @@ static bool backupExcludeDir(const char* absPath) {
 
 static bool backupExcludeFile(const char* absPath, const char* base) {
     if (strcmp(absPath, "/config.txt") == 0) return true;
+    if (!logFileInBackupWindow(absPath, base)) return true;
     size_t bl = strlen(base);
     if (bl >= 4) {
         const char* ext = base + bl - 4;
@@ -3379,6 +3418,78 @@ static void saveLastBackupDate(const char* date) {
     f.close();
     if (SD.exists(LAST_BACKUP_PATH)) SD.remove(LAST_BACKUP_PATH);
     SD.rename(LAST_BACKUP_TMP, LAST_BACKUP_PATH);
+}
+
+// Delete /logs/YYYY/YYYY-MM-DD.csv files older than LOG_RETAIN_DAYS (see
+// above). Runs once a day from the main loop; collect-then-delete so no
+// directory is mutated while being iterated. errors.log / .old are capped
+// by their own 64KB rotation and are left alone.
+static void pruneOldLogs() {
+    struct tm tm;
+    if (!getLocalTime(&tm, 0)) return;
+    time_t cut = mktime(&tm) - (time_t)LOG_RETAIN_DAYS * 86400;
+    struct tm ct;
+    localtime_r(&cut, &ct);
+    char cutoff[11];
+    strftime(cutoff, sizeof(cutoff), "%Y-%m-%d", &ct);
+
+    // Small stack buffer (64 x 32B = 2KB): collect one batch, delete after
+    // all handles close, repeat until a pass finds nothing. Reopens /logs
+    // every pass since handles can't be reused after close. Drains any
+    // backlog (e.g. months without pruning) without risking the loop-task
+    // stack, which a hundreds-of-entries array would overflow.
+    int totalPruned = 0;
+    while (true) {
+        char victims[64][32];
+        int victimCount = 0;
+        File logsDir = SD.open("/logs");
+        if (!logsDir || !logsDir.isDirectory()) { if (logsDir) logsDir.close(); break; }
+        File yearDir = logsDir.openNextFile();
+        while (yearDir) {
+            String yFull = yearDir.name();
+            bool yIsDir = yearDir.isDirectory();
+            yearDir.close();
+            int ys = yFull.lastIndexOf('/');
+            String yBare = (ys >= 0) ? yFull.substring(ys + 1) : yFull;
+            if (yIsDir) {
+                String yPath = String("/logs/") + yBare;
+                File dayDir = SD.open(yPath.c_str());
+                if (dayDir && dayDir.isDirectory()) {
+                    File day = dayDir.openNextFile();
+                    while (day) {
+                        String dFull = day.name();
+                        bool dIsDir = day.isDirectory();
+                        day.close();
+                        if (!dIsDir) {
+                            int ds = dFull.lastIndexOf('/');
+                            String dBare = (ds >= 0) ? dFull.substring(ds + 1) : dFull;
+                            if (dBare.length() == 14 && dBare.endsWith(".csv") &&
+                                dBare.substring(0, 10) < String(cutoff)) {
+                                String vp = yPath + "/" + dBare;
+                                strncpy(victims[victimCount], vp.c_str(), 31);
+                                victims[victimCount][31] = '\0';
+                                victimCount++;
+                            }
+                        }
+                        if (victimCount >= 64) { day.close(); break; }
+                        day = dayDir.openNextFile();
+                    }
+                    dayDir.close();
+                } else if (dayDir) {
+                    dayDir.close();
+                }
+            }
+            if (victimCount >= 64) { yearDir.close(); break; }
+            yearDir = logsDir.openNextFile();
+        }
+        logsDir.close();
+        for (int i = 0; i < victimCount; i++) SD.remove(victims[i]);
+        totalPruned += victimCount;
+        if (victimCount < 64) break;
+    }
+    if (totalPruned > 0) {
+        Serial.printf("[logs] pruned %d csv(s) older than %s\n", totalPruned, cutoff);
+    }
 }
 
 #define MAINTENANCE_STATE_PATH "/stats/maintenance.txt"
@@ -3500,6 +3611,19 @@ void buildAndSendBackup() {
     backupRunning = true;
     uint32_t seq = (uint32_t)millis();
     size_t totalOut = 0;
+
+    // Cutoff for the /logs rolling window (see LOG_BACKUP_DAYS). Computed
+    // here so every file decision in this run uses the same boundary.
+    struct tm btm;
+    if (getLocalTime(&btm, 0)) {
+        time_t nowSec = mktime(&btm);
+        time_t cut = nowSec - (time_t)(LOG_BACKUP_DAYS - 1) * 86400;
+        struct tm ct;
+        localtime_r(&cut, &ct);
+        strftime(backupLogsCutoff, sizeof(backupLogsCutoff), "%Y-%m-%d", &ct);
+    } else {
+        backupLogsCutoff[0] = '\0';
+    }
 
     String start = "{\"type\":\"event\",\"event\":\"backup_start\",\"seq\":";
     start += seq;
@@ -4855,6 +4979,10 @@ void setup() {
             rss += text;
             rss += "</description></item>";
         };
+        item("Sep 3, 2026", "Thu, 03 Sep 2026 02:00:00 GMT",
+             "Fixed a boot-loop caused by a corrupted flash filesystem (crashed on the first file write after Wi-Fi connect) by reflashing firmware and filesystem and restoring state from the R2 backup. Daily R2 backups now also include the last 7 days of sensor logs, and the device prunes logs older than 10 days so the 1.3MB flash partition can't fill up again.");
+        item("Aug 26, 2026", "Wed, 26 Aug 2026 00:00:00 GMT",
+             "CCS811 reliability fix: a CO2 sensor that latches its internal error flag (power glitch or bus disturbance) is now software-reset and re-initialized automatically while the board keeps running, instead of showing not responding until a manual reboot. The error log records the chip's own error code (heater fault, max sensing-element resistance, etc.) when a recovery is attempted, and the bus-recovery path no longer masks a dead sensor as healthy.");
         item("Aug 6, 2026", "Thu, 06 Aug 2026 09:00:00 GMT",
              "Live ADS-B aircraft tracking via the local piaware receiver: new /adsb page with an interactive map and flight table, plus a tracking strip on the homepage. The ESP polls the receiver every 5s, filters to the planes being tracked, and streams compact updates to every viewer through the same SSE pipeline as the sensor stats.");
         item("Aug 5, 2026", "Wed, 05 Aug 2026 12:00:00 GMT",
@@ -7934,13 +8062,82 @@ static void tryI2cRecovery() {
 
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setTimeOut(100);
-    bme.begin(0x76);
-    ccs.begin();
+    // Only treat a sensor as recovered if its re-init actually succeeded.
+    // Faking last*GoodAt here would mask a dead chip for another full
+    // staleness window.
+    if (bme.begin(0x76)) lastBmeGoodAt = now;
+    if (ccs.begin())     lastCcsGoodAt = now;
+}
 
-    // Push the staleness clock forward so we give the sensors a full window
-    // to produce a fresh read before we'd consider another reset.
-    lastBmeGoodAt = now;
-    lastCcsGoodAt = now;
+// A CCS811 can latch its internal ERROR flag after a power glitch, bus
+// disturbance, or sensing-element fault, and keeps it set until a software
+// (SW_RESET) or hardware reset. BME280 on the same bus stays healthy, so
+// the both-stale bus recovery above never fires for a CCS811-only failure.
+// The Adafruit lib swallows I2C errors (read8() returns 0x00 on failure),
+// so read STATUS/ERROR_ID directly to log what actually went wrong.
+static void ccs811Diagnostic() {
+    uint8_t status = 0, err = 0;
+    Wire.beginTransmission(CCS811_ADDRESS);
+    Wire.write(0x00);
+    bool got = (Wire.endTransmission(false) == 0)
+        && Wire.requestFrom((uint8_t)CCS811_ADDRESS, (uint8_t)1) >= 1;
+    if (got) status = Wire.read();
+    Wire.beginTransmission(CCS811_ADDRESS);
+    Wire.write(0xE0);
+    if (Wire.endTransmission(false) == 0
+        && Wire.requestFrom((uint8_t)CCS811_ADDRESS, (uint8_t)1) >= 1)
+        err = Wire.read();
+    if (!got) {
+        Serial.println("[sensor] CCS811 diag: no ACK on I2C (check wiring/power)");
+        return;
+    }
+    const char* errText = err == 0 ? "none"
+        : (err & 0x20) ? "HEATER_SUPPLY" : (err & 0x10) ? "HEATER_FAULT"
+        : (err & 0x08) ? "MAX_RESISTANCE" : (err & 0x04) ? "MEASMODE_INVALID"
+        : (err & 0x02) ? "READ_REG_INVALID" : "WRITE_REG_INVALID";
+    char buf[128];
+    snprintf(buf, sizeof(buf), "CCS811 diag: status=0x%02X error_id=0x%02X (%s)",
+             status, err, errText);
+    Serial.println(buf);
+    // ERROR_ID is latched until reset, so the identical entry would repeat
+    // on every cooldown; log only when the error bits actually change.
+    static uint8_t lastErr = 0xFF;
+    if (err != lastErr) { lastErr = err; if (err) logError("sensor", buf); }
+}
+
+// Recovery for a CCS811-only stall: SW-reset and re-init the chip on a
+// cooldown. begin() runs the SW_RESET sequence, restarts the app, and sets
+// 1-second drive mode, which clears the latched ERROR flag. On success the
+// staleness clock is pushed forward so the loop has a full window to see
+// the first fresh DATA_READY; on failure nothing is faked and the stale
+// transition log stays accurate.
+static void tryCcs811Recovery() {
+    static unsigned long lastTryAt = 0;
+    static bool lastRecoveryOk = true; // stale-transition log already covers first failure
+    unsigned long now = millis();
+    if (lastTryAt && now - lastTryAt < 120000UL) return;
+    lastTryAt = now;
+
+    Serial.println("[sensor] CCS811 stale, SW-resetting chip");
+    ccs811Diagnostic();
+    bool ok = ccs.begin();
+    if (ok) {
+        if (ccsHealth.retired) {
+            ccsHealth.retired = false;
+            ccsHealth.retired_unix = 0;
+            ccsHealth.consecutive_bad = 0;
+            saveSensorHealth();
+            logError("sensor", "CCS811 recovered via SW reset; retire flag cleared");
+        } else if (!lastRecoveryOk) {
+            logError("sensor", "CCS811 recovered via SW reset");
+        }
+        lastCcsGoodAt = now;
+    } else if (lastRecoveryOk) {
+        logError("sensor", "CCS811 SW reset FAILED (chip not ACKing, check wiring)");
+    }
+    lastRecoveryOk = ok;
+    Serial.println(ok ? "[sensor] CCS811 SW reset OK"
+                      : "[sensor] CCS811 SW reset FAILED, check wiring");
 }
 
 // Format a duration (seconds) as "Xd Yh" / "Yh Zm" / "Zm Zs".
@@ -8283,7 +8480,14 @@ void loop() {
     }
     // Both sensors stale at once usually means a wedged bus, not two
     // independent failures. Kick the bus (cooldown inside prevents thrash).
-    if (bmeBadNow && ccsBadNow) tryI2cRecovery();
+    // A CCS811-only stall is usually the chip's latched ERROR flag, which
+    // needs its own SW reset; BME280 staying healthy means the both-stale
+    // path never fires for it.
+    if (bmeBadNow && ccsBadNow) {
+        tryI2cRecovery();
+    } else if (ccsBadNow && !ccsHealth.retired) {
+        tryCcs811Recovery();
+    }
 
     if (millis() - lastCheckpointMs > CHECKPOINT_INTERVAL_MS) {
         lastCheckpointMs = millis();
@@ -8518,6 +8722,26 @@ void loop() {
     if (pendingBackupFlag && !busyWithUpload) {
         pendingBackupFlag = false;
         buildAndSendBackup();
+    }
+
+    // On-device /logs retention (see LOG_RETAIN_DAYS): once a day, no WS
+    // needed. Runs independently of the backup so a WS outage week can't
+    // fill the partition.
+    static unsigned long lastPruneCheckMs = 0;
+    static char lastPruneDate[11] = "";
+    if (millis() - lastPruneCheckMs > 60000UL) {
+        lastPruneCheckMs = millis();
+        struct tm ptm;
+        if (getLocalTime(&ptm, 0)) {
+            char today[11];
+            snprintf(today, sizeof(today), "%04d-%02d-%02d",
+                     ptm.tm_year + 1900, ptm.tm_mon + 1, ptm.tm_mday);
+            if (strcmp(today, lastPruneDate) != 0) {
+                strncpy(lastPruneDate, today, sizeof(lastPruneDate) - 1);
+                lastPruneDate[sizeof(lastPruneDate) - 1] = '\0';
+                pruneOldLogs();
+            }
+        }
     }
 
     // Shelly poll for power monitoring. Skips silently if no shelly_url
