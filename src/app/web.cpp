@@ -12,6 +12,7 @@
 #include "relay.h"
 #include "sensors.h"
 #include "state.h"
+#include "adsb.h"
 #include "storage.h"
 #include "util.h"
 
@@ -135,7 +136,15 @@ void sendText(AsyncWebServerRequest* r, int code, const char* body) {
 // Static assets ship pre-gzipped; serving the .gz directly keeps the LWIP pbuf
 // pool clear, which is what stops relayed pushes from failing under load.
 const char* mimeFor(const char* path) {
-  const char* dot = strrchr(path, '.');
+  // Look past a trailing .gz: pre-compressed assets keep their real type.
+  size_t len = strlen(path);
+  if (len > 3 && strcmp(path + len - 3, ".gz") == 0) len -= 3;
+  char bare[80];
+  if (len >= sizeof(bare)) len = sizeof(bare) - 1;
+  memcpy(bare, path, len);
+  bare[len] = '\0';
+
+  const char* dot = strrchr(bare, '.');
   if (!dot) return "application/octet-stream";
   if (strcmp(dot, ".html") == 0) return "text/html";
   if (strcmp(dot, ".json") == 0) return "application/json";
@@ -189,6 +198,7 @@ void sendAsset(AsyncWebServerRequest* r, const char* base, const char* cacheCont
   if (len > kBufferCap) {
     AsyncWebServerResponse* resp =
         r->beginResponse(f, String(path), mimeFor(path));
+    if (useGz) resp->addHeader("Content-Encoding", "gzip");
     if (cacheControl) resp->addHeader("Cache-Control", cacheControl);
     r->send(resp);
     return;
@@ -806,8 +816,9 @@ void handleRelayedRequest(int32_t id, const char* method, const char* path,
   }
 
   if (strcmp(path, "/adsb.json") == 0) {
-    // Tracking moved to the Worker; the page self-hides on an empty fleet.
-    sendJsonBuf("{\"now\":0,\"aircraft\":[]}", "no-store");
+    // The Worker tracks and shapes the fleet; this is the fallback it relays
+    // for when its own cache is cold, so return the same compact shape.
+    sendJsonBuf(adsb::lastJson(), "no-store");
     return;
   }
 
@@ -948,7 +959,9 @@ void begin() {
   // The Shelly/ADS-B features are gone. Both endpoints stay registered and
   // report an empty, valid shape so the pages self-hide instead of erroring.
   g_server.on("/adsb.json", HTTP_GET, [](AsyncWebServerRequest* r) {
-    sendJson(r, "{\"now\":0,\"aircraft\":[]}", "no-store");
+    // Served from the payload adsb::tick() already built, so this costs no
+    // network round trip and answers even between polls.
+    sendJson(r, adsb::lastJson(), "no-store");
   });
 
   g_server.on("/records.json", HTTP_GET, [](AsyncWebServerRequest* r) {

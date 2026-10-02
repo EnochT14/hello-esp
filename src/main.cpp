@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include <esp_log.h>
 
+#include "app/adsb.h"
 #include "app/backup.h"
 #include "app/board.h"
 #include "app/config.h"
@@ -171,6 +172,7 @@ void setup() {
   state::begin();
   guestbook::begin();
   sensors::begin();
+  adsb::begin();
   backup::begin();
   relay::begin();
 
@@ -189,6 +191,9 @@ void setup() {
 
 void loop() {
   connectWifi();
+
+  // Polls the LAN receiver on its own interval and pushes a compact extract.
+  adsb::tick();
 
   // Late NTP: poll the already-started client (no re-init), then reconcile
   // anything that was held back while the clock was unknown.

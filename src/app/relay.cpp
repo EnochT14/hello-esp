@@ -517,6 +517,11 @@ void pushConsole(const char* json) {
   writeFrame(json, strlen(json));
 }
 
+void pushRaw(const char* json, size_t len) {
+  if (!g_socketOpen || !g_authed) return;
+  writeFrame(json, len);
+}
+
 void pushBackupStart(uint32_t seq, const char* generatedAt, const char* firmware,
                      const char* uptime, size_t totalBytes) {
   if (!g_socketOpen || !g_authed) return;
