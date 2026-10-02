@@ -433,17 +433,14 @@ static size_t buildHistoryIndexJson(char* out, size_t cap) {
 }
 
 static size_t buildStatsCurrentJson(char* out, size_t cap) {
-  // Each period is serialised into its own slice of the caller-supplied buffer
-  // rather than three stack locals, which is 1.9KB the loop task cannot spare.
-  const size_t slice = (cap - 32) / 3;
-  char* w = out;
-  char* m = w + slice;
-  char* y = m + slice;
-  state::week().toJson(w, slice, state::weekLabel());
-  state::month().toJson(m, slice, state::monthLabel());
-  state::year().toJson(y, slice, state::yearLabel());
-  return snprintf(out + (cap - 32) * 0 + 0, cap,
-                  "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
+  // The three periods must not live inside `out`: snprintf would be reading the
+  // %s arguments from the same bytes it is writing. Serialising into stack
+  // buffers first keeps source and destination disjoint.
+  char w[640], m[640], y[640];
+  state::week().toJson(w, sizeof(w), state::weekLabel());
+  state::month().toJson(m, sizeof(m), state::monthLabel());
+  state::year().toJson(y, sizeof(y), state::yearLabel());
+  return snprintf(out, cap, "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
 }
 
 // Newest-first page of approved guestbook entries.
@@ -576,7 +573,7 @@ static size_t buildGuestbookRss(char* out, size_t cap) {
 // of those pile up to exhaust lwIP's MEMP_SYS_TIMEOUT pool - which aborts the
 // chip inside sys_timeout(). So every branch below terminates in a response,
 // and the fallback answers 404 rather than falling silent.
-static char g_relayBuf[4400];
+static char g_relayBuf[3800];
 
 void handleRelayedRequest(int32_t id, const char* method, const char* path,
                           const char* body) {
@@ -746,6 +743,8 @@ void handleRelayedRequest(int32_t id, const char* method, const char* path,
   sendText(404, "not found", "text/plain", "no-store");
 }
 
+static char g_lanBuf[3800];
+
 // --- routes ---------------------------------------------------------------
 
 
@@ -803,7 +802,7 @@ void begin() {
   // --- dashboard payload ---
   g_server.on("/stats", HTTP_GET, [](AsyncWebServerRequest* r) {
     
-    if (buildStatsJsonRaw(g_relayBuf, sizeof(g_relayBuf))) sendJson(r, g_relayBuf, "no-store");
+    if (buildStatsJsonRaw(g_lanBuf, sizeof(g_lanBuf))) sendJson(r, g_lanBuf, "no-store");
     else sendText(r, 500, "stats unavailable");
   });
 
@@ -815,14 +814,14 @@ void begin() {
 
   g_server.on("/records.json", HTTP_GET, [](AsyncWebServerRequest* r) {
     
-    state::recordsJson(g_relayBuf, sizeof(g_relayBuf));
-    sendJson(r, g_relayBuf, "public, max-age=300");
+    state::recordsJson(g_lanBuf, sizeof(g_lanBuf));
+    sendJson(r, g_lanBuf, "public, max-age=300");
   });
 
   g_server.on("/countries", HTTP_GET, [](AsyncWebServerRequest* r) {
     
     size_t o = 0;
-    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "{");
+    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "{");
     std::string raw;
     if (fsx::readAll("/countries.csv", raw, 4096)) {
       const char* p = raw.c_str();
@@ -837,7 +836,7 @@ void begin() {
           char* cr = strchr(line, '\r');
           if (cr) *cr = '\0';
           if (line[2] == ',') {
-            o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "%s\"%c%c\":%s",
+            o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "%s\"%c%c\":%s",
                           first ? "" : ",", line[0], line[1], line + 3);
             first = false;
           }
@@ -846,8 +845,8 @@ void begin() {
         p = eol + 1;
       }
     }
-    snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "}");
-    sendJson(r, g_relayBuf, "public, max-age=60");
+    snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "}");
+    sendJson(r, g_lanBuf, "public, max-age=60");
   });
 
   g_server.on("/console.json", HTTP_GET, [](AsyncWebServerRequest* r) {
@@ -858,7 +857,7 @@ void begin() {
   g_server.on("/history.json", HTTP_GET, [](AsyncWebServerRequest* r) {
     
     size_t o = 0;
-    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "{\"weekly\":[");
+    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "{\"weekly\":[");
     // Archives live at /stats/{weekly,monthly}/<year>/<label>.json; the API
     // flattens the year directory away.
     auto emitList = [&](const char* kind, bool* first) {
@@ -880,7 +879,7 @@ void begin() {
           else snprintf(label, sizeof(label), "%d-%02d", y, w);
           snprintf(file, sizeof(file), "%s/%s.json", dir, label);
           if (!fsx::exists(file)) continue;
-          o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "%s\"%s\"", *first ? "" : ",", label);
+          o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "%s\"%s\"", *first ? "" : ",", label);
           *first = false;
         }
       }
@@ -888,23 +887,23 @@ void begin() {
     };
     bool first = true;
     emitList("weekly", &first);
-    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "],\"monthly\":[");
+    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "],\"monthly\":[");
     first = true;
     emitList("monthly", &first);
-    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "],\"yearly\":[");
+    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "],\"yearly\":[");
     first = true;
     for (int y = 2020; y <= 2100; ++y) {
       char file[64], label[8];
       snprintf(file, sizeof(file), "/stats/yearly/%d.json", y);
       if (!fsx::exists(file)) continue;
       snprintf(label, sizeof(label), "%d", y);
-      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "%s\"%s\"", first ? "" : ",", label);
+      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "%s\"%s\"", first ? "" : ",", label);
       first = false;
     }
-    snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o,
+    snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
              "],\"current\":{\"week\":\"%s\",\"month\":\"%s\",\"year\":\"%s\"}}",
              state::weekLabel(), state::monthLabel(), state::yearLabel());
-    sendJson(r, g_relayBuf, "public, max-age=300");
+    sendJson(r, g_lanBuf, "public, max-age=300");
   });
 
   g_server.on("/stats/current", HTTP_GET, [](AsyncWebServerRequest* r) {
@@ -913,13 +912,13 @@ void begin() {
     state::week().toJson(w, sizeof(w), state::weekLabel());
     state::month().toJson(m, sizeof(m), state::monthLabel());
     state::year().toJson(y, sizeof(y), state::yearLabel());
-    snprintf(g_relayBuf, sizeof(g_relayBuf), "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
-    sendJson(r, g_relayBuf, "public, max-age=300");
+    snprintf(g_lanBuf, sizeof(g_lanBuf), "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
+    sendJson(r, g_lanBuf, "public, max-age=300");
   });
 
   // Archive passthrough with an immutable cache header: these never change
   // once written.
-  g_server.on("/stats/weekly/", HTTP_GET, [](AsyncWebServerRequest* r) {
+  g_server.on("/stats/weekly/*", HTTP_GET, [](AsyncWebServerRequest* r) {
     const String label = r->url().substring(strlen("/stats/weekly/"));
     if (label.length() != 8 || label.indexOf("..") >= 0 || label.indexOf('/') >= 0) {
       sendText(r, 400, "bad label");
@@ -939,7 +938,7 @@ void begin() {
     sendJson(r, body.c_str(), "public, max-age=31536000, immutable");
   });
 
-  g_server.on("/stats/monthly/", HTTP_GET, [](AsyncWebServerRequest* r) {
+  g_server.on("/stats/monthly/*", HTTP_GET, [](AsyncWebServerRequest* r) {
     const String label = r->url().substring(strlen("/stats/monthly/"));
     if (label.length() != 7 || label.indexOf("..") >= 0 || label.indexOf('/') >= 0) {
       sendText(r, 400, "bad label");
@@ -1000,7 +999,7 @@ void begin() {
     });
 
     size_t o = 0;
-    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "{\"entries\":[");
+    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "{\"entries\":[");
     int emitted = 0;
     walkEntries(true, [&](const Row* row) {
       if (needle.length() && !util::containsCI(row->name, needle.c_str()) &&
@@ -1022,36 +1021,36 @@ void begin() {
         return true;
       });
 
-      if (emitted++) o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",");
-      emitEntry(*row, g_relayBuf, sizeof(g_relayBuf), &o, false);
-      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",\"reply_count\":%d", replyCount);
+      if (emitted++) o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",");
+      emitEntry(*row, g_lanBuf, sizeof(g_lanBuf), &o, false);
+      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",\"reply_count\":%d", replyCount);
       if (replyCount >= 1 && replyCount <= 2) {
-        o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",\"preview_replies\":[");
+        o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",\"preview_replies\":[");
         int pre = 0;
         walkEntries(true, [&](const Row* other) {
           if (pre >= 2) return false;
           if (strcmp(other->replyTo, row->id) != 0) return true;
-          if (pre++) o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",");
-          emitEntry(*other, g_relayBuf, sizeof(g_relayBuf), &o, true);
+          if (pre++) o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",");
+          emitEntry(*other, g_lanBuf, sizeof(g_lanBuf), &o, true);
           return true;
         });
-        o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "]");
+        o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "]");
       }
-      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "}");
+      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "}");
       return true;
     });
 
     const int offset = (pageNo - 1) * static_cast<int>(kPageSize);
     const bool hasMore = (offset + emitted) < totalApproved;
-    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o,
+    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
                   "],\"hasMore\":%s,\"total\":%d,\"countries\":%d",
                   hasMore ? "true" : "false", totalApproved, countryCount);
     if (q.length()) {
-      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",\"matching\":%d}", matching);
+      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",\"matching\":%d}", matching);
     } else {
-      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "}");
+      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "}");
     }
-    sendJson(r, g_relayBuf, q.length() ? nullptr : "public, max-age=30");
+    sendJson(r, g_lanBuf, q.length() ? nullptr : "public, max-age=30");
   });
 
   g_server.on("/guestbook/submit", HTTP_POST, [](AsyncWebServerRequest* r) {
@@ -1093,7 +1092,7 @@ void begin() {
     const size_t usedBytes = fsx::usedBytes();
     const size_t totalBytes = fsx::totalBytes();
 
-    snprintf(g_relayBuf, sizeof(g_relayBuf),
+    snprintf(g_lanBuf, sizeof(g_lanBuf),
         "{\"firmware\":\"%s\",\"chip_model\":\"%s\",\"chip_revision\":%d,"
         "\"cpu_freq_mhz\":%d,\"flash_size_mb\":%.1f,\"sdk_version\":\"%s\","
         "\"time_t_bytes\":%d,\"mac_address\":\"%s\",\"local_ip\":\"%s\","
@@ -1124,7 +1123,7 @@ void begin() {
         static_cast<unsigned long>(usedBytes), static_cast<unsigned long>(totalBytes),
         sensors::bmeRetired() ? "true" : "false",
         sensors::ccsRetired() ? "true" : "false");
-    sendJson(r, g_relayBuf, nullptr);
+    sendJson(r, g_lanBuf, nullptr);
   });
 
   g_server.on("/admin/export", HTTP_GET, [](AsyncWebServerRequest* r) {
@@ -1192,30 +1191,30 @@ void begin() {
     }
     
     size_t o = 0;
-    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "{\"entries\":[");
+    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "{\"entries\":[");
     int shown = 0;
     int idx = 0;
     walkEntries(false, [&](const Row* row) {
       const int myIdx = idx++;
       if (row->status != '0') return true;
       if (shown >= static_cast<int>(kPageSize)) return false;
-      if (shown++) o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",");
+      if (shown++) o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",");
       char m[256] = "", n[48] = "", t[40] = "";
       util::jsonEscape(row->message, m, sizeof(m));
       util::jsonEscape(row->name, n, sizeof(n));
       util::jsonEscape(row->time, t, sizeof(t));
-      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o,
+      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
                     "{\"idx\":%d,\"time\":\"%s\",\"country\":\"%s\",\"name\":\"%s\","
                     "\"message\":\"%s\",\"id\":\"%s\",\"reply_to\":\"%s\",\"approved\":0}",
                     myIdx, t, row->country, n, m, row->id, row->replyTo);
       return true;
     });
-    snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o,
+    snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
              "],\"hasMore\":false,\"counts\":{\"new\":%u,\"approved\":%u,\"denied\":0,\"all\":%u}}",
              static_cast<unsigned>(guestbook::pendingCount()),
              static_cast<unsigned>(guestbook::approvedCount()),
              static_cast<unsigned>(guestbook::allCount()));
-    sendJson(r, g_relayBuf, nullptr);
+    sendJson(r, g_lanBuf, nullptr);
   });
 
   g_server.on("/guestbook/moderate-batch", HTTP_POST, [](AsyncWebServerRequest* r) {
@@ -1279,16 +1278,8 @@ void begin() {
   });
 
   g_server.onNotFound([](AsyncWebServerRequest* r) {
-    // AsyncWebServer prefix-matches, so /stats/* never reaches the explicit
-    // routes above; this is where those fall through.
-    const String url = r->url();
-    if (url.startsWith("/stats/") || url == "/stats") {
-      
-      if (buildStatsJsonRaw(g_relayBuf, sizeof(g_relayBuf))) {
-        sendJson(r, g_relayBuf, "no-store");
-        return;
-      }
-    }
+    // Genuinely unknown paths only. This must not hijack /stats/*: doing so
+    // shadowed /stats/current and served the dashboard blob in its place.
     sendAsset(r, "/404.html", "no-store");
   });
 

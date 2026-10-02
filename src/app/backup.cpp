@@ -12,6 +12,7 @@ namespace {
 
 constexpr int  kHourLocal = 4;
 constexpr uint32_t kIdleGapMs = 60000;
+constexpr uint16_t kFileGapMs = 60;
 
 bool     g_running = false;
 bool     g_requested = false;
@@ -142,6 +143,10 @@ void runOnce() {
     if (!logInWindow(abs, base)) return true;
     if (!relay::connected()) return false;  // abort the walk
     sendFile(abs, base, size, g_seq);
+    // Pace the bundle. The Worker stores each file to R2 as it completes, so
+    // flooding it faster than one put per file lets the socket die part way
+    // through and the whole snapshot is lost.
+    delay(kFileGapMs);
     return true;
   });
 

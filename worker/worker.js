@@ -1983,7 +1983,7 @@ export class EspRelay {
         this.hmacAuthenticated = true;
       }
 
-      server.addEventListener('message', (event) => {
+      server.addEventListener('message', async (event) => {
         // Only count activity once HMAC is verified. Pre-auth, an attacker
         // hammering the WS upgrade could indefinitely refresh this timestamp
         // and silently mask the deadman alert on a truly-dead device.
@@ -2076,7 +2076,20 @@ export class EspRelay {
           try {
             const msg = JSON.parse(data);
             if (msg.type === 'event') {
-              this.handleEvent(msg).catch((e) => console.error('handleEvent error:', e && e.message));
+              // waitUntil, not a bare floating promise and not a local await.
+              // Awaiting inside a WebSocket 'message' listener does not keep the
+              // Worker alive - the runtime never awaits listeners - so the
+              // backup's R2 writes were cancelled when the request context
+              // ended, with nothing failing, just stopping. This Worker stores
+              // its DurableObjectState as `this.state`, so that is where
+              // waitUntil lives; guard it because the field is not present on
+              // every runtime version.
+              const pending = this.handleEvent(msg)
+                .catch((e) => console.error('handleEvent error:', e && e.message));
+              const ctx = this.state || this.ctx;
+              if (ctx && typeof ctx.waitUntil === 'function') {
+                ctx.waitUntil(pending);
+              }
               return;
             }
             // Drop metadata for IDs we never asked for. Without this guard, a
