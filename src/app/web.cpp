@@ -129,19 +129,49 @@ void sendText(AsyncWebServerRequest* r, int code, const char* body) {
 
 // Static assets ship pre-gzipped; serving the .gz directly keeps the LWIP pbuf
 // pool clear, which is what stops relayed pushes from failing under load.
+// Static assets ship pre-gzipped; serving the .gz directly keeps the LWIP pbuf
+// pool clear, which is what stops relayed pushes from failing under load.
 void sendAsset(AsyncWebServerRequest* r, const char* base, const char* cacheControl) {
   char gz[160];
   snprintf(gz, sizeof(gz), "%s.gz", base);
   const bool useGz = r->header("Accept-Encoding").indexOf("gzip") >= 0 && fsx::exists(gz);
   const char* path = useGz ? gz : base;
 
-  File f = fsx::vol().open(path, FILE_READ);
-  if (!f) {
+  File probe = fsx::vol().open(path, FILE_READ);
+  if (!probe) {
     sendText(r, 404, "not found");
     return;
   }
-  AsyncWebServerResponse* resp =
-      r->beginResponse(static_cast<Stream&>(f), "text/html", f.size());
+  const size_t len = probe.size();
+  probe.close();
+  if (!len) {
+    sendText(r, 404, "not found");
+    return;
+  }
+  // Read into a buffer and send that, rather than handing AsyncWebServer a
+  // Stream&.
+  //
+  // beginResponse(Stream&, ct, len) only stores the pointer, so a File opened in
+  // this function was destroyed on return and the response streamed from freed
+  // memory - every page route hung until the client timed out, while the JSON
+  // routes (which copy into a buffer) stayed fast. AsyncFileSource is not an
+  // option here because it reopens through the global LittleFS, not this
+  // project's volume.
+  //
+  // The cap keeps a pathological asset from exhausting the heap. Gzipped pages
+  // are 5-37KB, so this is generous.
+  constexpr size_t kAssetCap = 96 * 1024;
+  if (len > kAssetCap) {
+    sendText(r, 500, "asset too large");
+    return;
+  }
+  std::string body;
+  if (!fsx::readAll(path, body, len)) {
+    sendText(r, 404, "not found");
+    return;
+  }
+  AsyncWebServerResponse* resp = r->beginResponse(
+      200, "text/html", reinterpret_cast<const uint8_t*>(body.data()), body.size());
   if (useGz) resp->addHeader("Content-Encoding", "gzip");
   if (cacheControl) resp->addHeader("Cache-Control", cacheControl);
   r->send(resp);
