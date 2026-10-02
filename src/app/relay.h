@@ -34,15 +34,12 @@ bool sendJson(const char* json, size_t len);
 // Device -> Worker
 void pushStats(const char* statsJson);
 void pushConsole(const char* json);
-
-// Sends a complete, already-framed event payload verbatim.
-void pushRaw(const char* json, size_t len);
 void pushBackupStart(uint32_t seq, const char* generatedAt, const char* firmware,
                      const char* uptime, size_t totalBytes);
-bool pushBackupFileStart(uint32_t seq, const char* name, size_t size);
-bool pushBackupFileChunk(uint32_t seq, const char* b64);
-bool pushBackupFileEnd(uint32_t seq, const char* name);
-bool pushBackupFileSkipped(uint32_t seq, const char* name, size_t size, const char* reason);
+void pushBackupFileStart(uint32_t seq, const char* name, size_t size);
+void pushBackupFileChunk(uint32_t seq, const char* b64);
+void pushBackupFileEnd(uint32_t seq, const char* name);
+void pushBackupFileSkipped(uint32_t seq, const char* name, size_t size, const char* reason);
 void pushBackupEnd(uint32_t seq, size_t totalBytes);
 void pushBackupNow();
 

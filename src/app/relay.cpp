@@ -91,31 +91,6 @@ void hmacSha256Hex(const char* key, const char* msg, char* out) {
   out[64] = '\0';
 }
 
-// Writes every byte or reports failure. NetworkClientSecure::write() may accept
-// fewer bytes than offered - the TLS record and socket buffers drain in
-// whatever sizes the network hands over - and treating a short write as fatal
-// silently truncated relay responses mid-base64, which the Worker rejected as
-// invalid and dropped. Retrying until the buffer is empty is the only correct
-// behaviour here.
-bool writeAll(const uint8_t* data, size_t len) {
-  size_t sent = 0;
-  unsigned spins = 0;
-  while (sent < len) {
-    const int n = g_tls.write(data + sent, len - sent);
-    if (n > 0) {
-      sent += static_cast<size_t>(n);
-      spins = 0;
-      continue;
-    }
-    // A zero or negative write means the socket buffer is full, not broken.
-    // Back off briefly, but give up eventually so a dead peer cannot wedge the
-    // loop task forever.
-    if (++spins > 200) return false;
-    delay(2);
-  }
-  return true;
-}
-
 // Writes a masked text frame. The mask is a constant because it has no
 // confidentiality role here: TLS already provides that, and a constant keeps
 // the hot path free of randomness.
@@ -142,8 +117,8 @@ bool writeFrame(const char* payload, size_t len) {
     headerLen = 10;
   }
   g_lastActivity = millis();
-  if (!writeAll(header, headerLen)) return false;
-  if (!writeAll(kMask, 4)) return false;
+  if (g_tls.write(header, headerLen) != headerLen) return false;
+  if (g_tls.write(kMask, 4) != 4) return false;
 
   uint8_t chunk[512];
   size_t sent = 0;
@@ -152,7 +127,7 @@ bool writeFrame(const char* payload, size_t len) {
     for (size_t i = 0; i < n; ++i) {
       chunk[i] = static_cast<uint8_t>(payload[sent + i]) ^ kMask[(sent + i) & 3];
     }
-    if (!writeAll(chunk, n)) return false;
+    if (g_tls.write(chunk, n) != n) return false;
     sent += n;
     // Yield between chunks: this is the only place the loop task gets a chance
     // to run while a large push is in flight.
@@ -359,7 +334,7 @@ bool handshake() {
     if (++g_fastFails > kMaxBackoffFails) g_fastFails = kMaxBackoffFails;
     return false;
   }
-  g_tls.setTimeout(5000);
+  g_tls.setTimeout(3000);
 
   // The nonce only has to satisfy the handshake shape; authentication is
   // worker_key in the query string plus the HMAC challenge that follows.
@@ -422,39 +397,30 @@ bool handshake() {
   return true;
 }
 
-// These three writes form one WebSocket text frame, so they must all be
-// reported to the caller. They previously used g_tls.write() directly and
-// discarded the result, which is how a chunk could be dropped silently.
-// Builds one complete event JSON and sends it as a single WebSocket frame.
-//
-// These used writeAll() directly, which writes raw bytes to the TLS socket with
-// no WebSocket framing: no 0x81 opcode, no length, no mask. The Worker therefore
-// received an unparseable stream for every chunk event, so backup_file_chunk
-// never arrived and only backup_file_start - which does go through writeFrame -
-// was ever seen. Every 576-byte chunk of the bundle was silently discarded.
-bool streamEvent(const char* eventName, uint32_t seq, bool hasSeq,
-                 const void* body, size_t bodyLen) {
-  if (!g_socketOpen || !g_authed) return false;
-
-  // Header + body + closing quote/brace in one buffer so it can be framed.
-  // b64 is at most 800 chars, so this is comfortably bounded.
-  char frame[1024];
+void eventHeader(const char* eventName, uint32_t seq, bool hasSeq, size_t* written) {
+  char head[128];
   int n;
   if (hasSeq) {
-    n = snprintf(frame, sizeof(frame),
+    n = snprintf(head, sizeof(head),
                  "{\"type\":\"event\",\"event\":\"%s\",\"seq\":%u,\"data\":\"",
                  eventName, (unsigned)seq);
   } else {
-    n = snprintf(frame, sizeof(frame),
+    n = snprintf(head, sizeof(head),
                  "{\"type\":\"event\",\"event\":\"%s\",\"data\":\"", eventName);
   }
-  if (n <= 0 || static_cast<size_t>(n) + bodyLen + 3 > sizeof(frame)) return false;
+  if (n > 0) g_tls.write(reinterpret_cast<const uint8_t*>(head), static_cast<size_t>(n));
+  *written = static_cast<size_t>(n > 0 ? n : 0);
+}
 
-  memcpy(frame + n, body, bodyLen);
-  n += static_cast<int>(bodyLen);
-  frame[n++] = '"';
-  frame[n++] = '}';
-  return writeFrame(frame, static_cast<size_t>(n));
+void endEvent() { g_tls.write(reinterpret_cast<const uint8_t*>("\"}"), 2); }
+
+void streamEvent(const char* eventName, uint32_t seq, bool hasSeq,
+                 const void* body, size_t bodyLen) {
+  if (!g_socketOpen || !g_authed) return;
+  size_t n = 0;
+  eventHeader(eventName, seq, hasSeq, &n);
+  g_tls.write(reinterpret_cast<const uint8_t*>(body), bodyLen);
+  endEvent();
 }
 
 }  // namespace
@@ -517,11 +483,6 @@ void pushConsole(const char* json) {
   writeFrame(json, strlen(json));
 }
 
-void pushRaw(const char* json, size_t len) {
-  if (!g_socketOpen || !g_authed) return;
-  writeFrame(json, len);
-}
-
 void pushBackupStart(uint32_t seq, const char* generatedAt, const char* firmware,
                      const char* uptime, size_t totalBytes) {
   if (!g_socketOpen || !g_authed) return;
@@ -533,37 +494,37 @@ void pushBackupStart(uint32_t seq, const char* generatedAt, const char* firmware
   if (n > 0) writeFrame(buf, static_cast<size_t>(n));
 }
 
-bool pushBackupFileStart(uint32_t seq, const char* name, size_t size) {
-  if (!g_socketOpen || !g_authed) return false;
+void pushBackupFileStart(uint32_t seq, const char* name, size_t size) {
+  if (!g_socketOpen || !g_authed) return;
   char buf[320];
   const int n = snprintf(buf, sizeof(buf),
       "{\"type\":\"event\",\"event\":\"backup_file_start\",\"seq\":%u,"
       "\"name\":\"%s\",\"size\":%u}", (unsigned)seq, name, (unsigned)size);
-  return n > 0 && writeFrame(buf, static_cast<size_t>(n));
+  if (n > 0) writeFrame(buf, static_cast<size_t>(n));
 }
 
-bool pushBackupFileChunk(uint32_t seq, const char* b64) {
-  if (!g_socketOpen || !g_authed) return false;
-  return streamEvent("backup_file_chunk", seq, true, b64, strlen(b64));
+void pushBackupFileChunk(uint32_t seq, const char* b64) {
+  if (!g_socketOpen || !g_authed) return;
+  streamEvent("backup_file_chunk", seq, true, b64, strlen(b64));
 }
 
-bool pushBackupFileEnd(uint32_t seq, const char* name) {
-  if (!g_socketOpen || !g_authed) return false;
+void pushBackupFileEnd(uint32_t seq, const char* name) {
+  if (!g_socketOpen || !g_authed) return;
   char buf[320];
   const int n = snprintf(buf, sizeof(buf),
       "{\"type\":\"event\",\"event\":\"backup_file_end\",\"seq\":%u,\"name\":\"%s\"}",
       (unsigned)seq, name);
-  return n > 0 && writeFrame(buf, static_cast<size_t>(n));
+  if (n > 0) writeFrame(buf, static_cast<size_t>(n));
 }
 
-bool pushBackupFileSkipped(uint32_t seq, const char* name, size_t size, const char* reason) {
-  if (!g_socketOpen || !g_authed) return false;
+void pushBackupFileSkipped(uint32_t seq, const char* name, size_t size, const char* reason) {
+  if (!g_socketOpen || !g_authed) return;
   char buf[352];
   const int n = snprintf(buf, sizeof(buf),
       "{\"type\":\"event\",\"event\":\"backup_file_skipped\",\"seq\":%u,"
       "\"name\":\"%s\",\"size\":%u,\"reason\":\"%s\"}",
       (unsigned)seq, name, (unsigned)size, reason);
-  return n > 0 && writeFrame(buf, static_cast<size_t>(n));
+  if (n > 0) writeFrame(buf, static_cast<size_t>(n));
 }
 
 void pushBackupEnd(uint32_t seq, size_t totalBytes) {

@@ -373,37 +373,30 @@ bool readBlob(const char* path, uint8_t* version, void* out, size_t len) {
 void walk(const std::function<bool(const char*, const char*, size_t)>& fn) {
   if (!g_mounted) return;
 
-  // Explicit stack rather than recursion: the loop task's stack is precious.
+  // Explicit stack instead of recursion: depth is bounded by the path depth
+  // we create (/stats/weekly/2026) and the loop task's stack is precious.
   struct Level {
     char dir[64];
   };
-  // Deep enough for /logs/2026 and /stats/weekly/2026 with slack. The previous 6
-  // filled up and every remaining directory was dropped without a word, which
-  // is why the backup saw only the root files and never a log or archive CSV.
-  Level stack[12];
+  Level stack[6];
   int sp = 0;
   snprintf(stack[sp].dir, sizeof(stack[0].dir), "/");
   ++sp;
 
   while (sp > 0) {
     const int idx = --sp;
-    char dir[64];
-    snprintf(dir, sizeof(dir), "%s", stack[idx].dir);
+    const char* dir = stack[idx].dir;
 
     File d = LittleFS.open(dir);
     if (!d) continue;
-
-    // Canonical ESP32 iteration: the loop variable is advanced by
-    // openNextFile() itself. The previous form called child.close() and then
-    // re-assigned a copy-initialised File, which left the iteration's file
-    // handle in a bad state and stopped the listing after 17 entries - exactly
-    // the number of root files before the first subdirectory.
-    for (File child = d.openNextFile(); child; child = d.openNextFile()) {
+    File child = d.openNextFile();
+    while (child) {
       String name = child.name();
       const bool isDir = child.isDirectory();
       const size_t size = child.size();
-      const int slash = name.lastIndexOf('/');
+      int slash = name.lastIndexOf('/');
       String bare = (slash >= 0) ? name.substring(slash + 1) : name;
+      child.close();
 
       char abs[160];
       if (strcmp(dir, "/") == 0) {
@@ -416,13 +409,14 @@ void walk(const std::function<bool(const char*, const char*, size_t)>& fn) {
         if (sp < static_cast<int>(sizeof(stack) / sizeof(stack[0]))) {
           snprintf(stack[sp].dir, sizeof(stack[0].dir), "%s", abs);
           ++sp;
-        } else {
-          // Dropping a directory silently loses everything beneath it.
-          Serial.printf("[fs] walk depth exceeded, skipping %s\n", abs);
         }
-      } else if (!fn(abs, bare.c_str(), size)) {
-        break;
+      } else {
+        if (!fn(abs, bare.c_str(), size)) {
+          d.close();
+          return;
+        }
       }
+      child = d.openNextFile();
     }
     d.close();
   }

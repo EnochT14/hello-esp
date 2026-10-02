@@ -12,22 +12,10 @@
 #include "relay.h"
 #include "sensors.h"
 #include "state.h"
-#include "adsb.h"
 #include "storage.h"
 #include "util.h"
 
 namespace web {
-namespace {
-constexpr int kConsoleLines = 200;
-
-// Backs sendAsset. Must outlive the call: the response does not take a copy of
-// the body, it keeps the pointer and writes it after this function returns. A
-// local std::string was therefore destroyed on return and the response streamed
-// from freed memory - which by then held a previous HTTP response, so a 404
-// came back as 2146 bytes containing "HTTP/1.1". The JSON routes only worked
-// because they pass a static buffer.
-std::string g_assetBody;
-}
 namespace {
 
 AsyncWebServer g_server(80);
@@ -141,92 +129,19 @@ void sendText(AsyncWebServerRequest* r, int code, const char* body) {
 
 // Static assets ship pre-gzipped; serving the .gz directly keeps the LWIP pbuf
 // pool clear, which is what stops relayed pushes from failing under load.
-// Static assets ship pre-gzipped; serving the .gz directly keeps the LWIP pbuf
-// pool clear, which is what stops relayed pushes from failing under load.
-const char* mimeFor(const char* path) {
-  // Look past a trailing .gz: pre-compressed assets keep their real type.
-  size_t len = strlen(path);
-  if (len > 3 && strcmp(path + len - 3, ".gz") == 0) len -= 3;
-  char bare[80];
-  if (len >= sizeof(bare)) len = sizeof(bare) - 1;
-  memcpy(bare, path, len);
-  bare[len] = '\0';
-
-  const char* dot = strrchr(bare, '.');
-  if (!dot) return "application/octet-stream";
-  if (strcmp(dot, ".html") == 0) return "text/html";
-  if (strcmp(dot, ".json") == 0) return "application/json";
-  if (strcmp(dot, ".css") == 0) return "text/css";
-  if (strcmp(dot, ".js") == 0) return "application/javascript";
-  if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
-  if (strcmp(dot, ".png") == 0) return "image/png";
-  if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0) return "image/jpeg";
-  if (strcmp(dot, ".gif") == 0) return "image/gif";
-  if (strcmp(dot, ".webp") == 0) return "image/webp";
-  if (strcmp(dot, ".ico") == 0) return "image/x-icon";
-  if (strcmp(dot, ".csv") == 0) return "text/csv";
-  if (strcmp(dot, ".txt") == 0) return "text/plain";
-  return "application/octet-stream";
-}
-
 void sendAsset(AsyncWebServerRequest* r, const char* base, const char* cacheControl) {
   char gz[160];
   snprintf(gz, sizeof(gz), "%s.gz", base);
   const bool useGz = r->header("Accept-Encoding").indexOf("gzip") >= 0 && fsx::exists(gz);
   const char* path = useGz ? gz : base;
 
-  // One open, one read, one close. An earlier version opened the file to size
-  // it, closed that, then let readAll() open the path a second time. That
-  // double-open left the response body containing a previous HTTP response
-  // instead of the file: R2's copy of 404.html was clean while the device
-  // served 2146 bytes with "HTTP/1.1" embedded, and the length was right.
-  // Reading through the same handle that reported the size avoids it.
   File f = fsx::vol().open(path, FILE_READ);
   if (!f) {
     sendText(r, 404, "not found");
     return;
   }
-  const size_t len = f.size();
-  if (!len) {
-    f.close();
-    sendText(r, 404, "not found");
-    return;
-  }
-
-  // Above this size, buffering would need twice the asset in heap - an 80KB
-  // photo becomes 160KB against ~133KB free - so hand the response an owning
-  // file source that streams from flash.
-  //
-  // beginResponse(Stream&, ct, len) only stores the pointer, so a File opened
-  // here and destroyed on return left the response streaming from freed memory,
-  // which hung every page route. This overload takes ownership.
-  constexpr size_t kBufferCap = 40 * 1024;
-
-  if (len > kBufferCap) {
-    AsyncWebServerResponse* resp =
-        r->beginResponse(f, String(path), mimeFor(path));
-    if (useGz) resp->addHeader("Content-Encoding", "gzip");
-    if (cacheControl) resp->addHeader("Cache-Control", cacheControl);
-    r->send(resp);
-    return;
-  }
-
-  std::string& body = g_assetBody;
-  body.clear();
-  body.reserve(len);
-  uint8_t chunk[256];
-  size_t got;
-  while ((got = f.read(chunk, sizeof(chunk))) > 0 && body.size() < len) {
-    body.append(reinterpret_cast<char*>(chunk), got);
-  }
-  f.close();
-  if (body.empty()) {
-    sendText(r, 404, "not found");
-    return;
-  }
-
-  AsyncWebServerResponse* resp = r->beginResponse(
-      200, mimeFor(path), reinterpret_cast<const uint8_t*>(body.data()), body.size());
+  AsyncWebServerResponse* resp =
+      r->beginResponse(static_cast<Stream&>(f), "text/html", f.size());
   if (useGz) resp->addHeader("Content-Encoding", "gzip");
   if (cacheControl) resp->addHeader("Cache-Control", cacheControl);
   r->send(resp);
@@ -331,35 +246,15 @@ size_t walkEntries(bool approvedOnly, F cb) {
   return count;
 }
 
-// Appends to a bounded buffer and returns the new offset, clamped to cap.
-//
-// snprintf() returns the length it WOULD have written, so the old
-// `o += snprintf(buf + o, sizeof(buf) - o, ...)` let o run past the end of the
-// buffer. The next call then evaluated `sizeof(buf) - o` as a size_t, which
-// wrapped to an enormous value, and snprintf wrote past the end of a static
-// buffer. That corrupted memory hard enough to wedge the AsyncWebServer task:
-// after it, every LAN request hung and the device stopped answering on the
-// network. Clamping here means a full buffer simply stops accepting output.
-size_t appendBounded(char* buf, size_t cap, size_t o, const char* fmt, ...) {
-  if (o >= cap) return cap;
-  va_list ap;
-  va_start(ap, fmt);
-  const int n = vsnprintf(buf + o, cap - o, fmt, ap);
-  va_end(ap);
-  if (n < 0) return o;
-  const size_t next = o + static_cast<size_t>(n);
-  return next > cap ? cap : next;
-}
-
 void emitEntry(const Row& r, char* out, size_t cap, size_t* o, bool withReplyTo) {
   char e[32] = "", m[256] = "", n[48] = "", t[40] = "";
   util::jsonEscape(r.message, m, sizeof(m));
   util::jsonEscape(r.name, n, sizeof(n));
   util::jsonEscape(r.time, t, sizeof(t));
-  *o = appendBounded(out, cap, *o,
+  *o += snprintf(out + *o, cap - *o,
                  "{\"time\":\"%s\",\"country\":\"%s\",\"name\":\"%s\",\"message\":\"%s\",\"id\":\"%s\"",
                  t, r.country, n, m, r.id);
-  if (withReplyTo) *o = appendBounded(out, cap, *o, ",\"reply_to\":\"%s\"", r.replyTo);
+  if (withReplyTo) *o += snprintf(out + *o, cap - *o, ",\"reply_to\":\"%s\"", r.replyTo);
 }
 
 // --- /stats ---------------------------------------------------------------
@@ -462,7 +357,7 @@ size_t buildStatsJson(char* out, size_t cap) {
 
 static size_t buildCountriesJson(char* out, size_t cap) {
   size_t o = 0;
-  o = appendBounded(out, cap, o, "{");
+  o += snprintf(out + o, cap - o, "{");
   std::string raw;
   if (fsx::readAll("/countries.csv", raw, 4096)) {
     const char* p = raw.c_str();
@@ -477,7 +372,7 @@ static size_t buildCountriesJson(char* out, size_t cap) {
         char* cr = strchr(line, '\r');
         if (cr) *cr = '\0';
         if (line[2] == ',') {
-          o = appendBounded(out, cap, o, "%s\"%c%c\":%s",
+          o += snprintf(out + o, cap - o, "%s\"%c%c\":%s",
                         first ? "" : ",", line[0], line[1], line + 3);
           first = false;
         }
@@ -486,7 +381,7 @@ static size_t buildCountriesJson(char* out, size_t cap) {
       p = eol + 1;
     }
   }
-  o = appendBounded(out, cap, o, "}");
+  o += snprintf(out + o, cap - o, "}");
   return o;
 }
 
@@ -496,7 +391,7 @@ static size_t buildHistoryIndexJson(char* out, size_t cap) {
   struct tm t = {};
   const int thisYear = getLocalTime(&t, 0) ? (t.tm_year + 1900) : 2026;
   size_t o = 0;
-  o = appendBounded(out, cap, o, "{\"weekly\":[");
+  o += snprintf(out + o, cap - o, "{\"weekly\":[");
   auto emit = [&](const char* kind, bool* first) {
     for (int y = thisYear - 4; y <= thisYear; ++y) {
       char dir[64];
@@ -512,77 +407,43 @@ static size_t buildHistoryIndexJson(char* out, size_t cap) {
         }
         snprintf(file, sizeof(file), "%s/%s.json", dir, label);
         if (!fsx::exists(file)) continue;
-        o = appendBounded(out, cap, o, "%s\"%s\"", *first ? "" : ",", label);
+        o += snprintf(out + o, cap - o, "%s\"%s\"", *first ? "" : ",", label);
         *first = false;
       }
     }
   };
   bool first = true;
   emit("weekly", &first);
-  o = appendBounded(out, cap, o, "],\"monthly\":[");
+  o += snprintf(out + o, cap - o, "],\"monthly\":[");
   first = true;
   emit("monthly", &first);
-  o = appendBounded(out, cap, o, "],\"yearly\":[");
+  o += snprintf(out + o, cap - o, "],\"yearly\":[");
   first = true;
   for (int y = thisYear - 4; y <= thisYear; ++y) {
     char file[64], label[8];
     snprintf(file, sizeof(file), "/stats/yearly/%d.json", y);
     if (!fsx::exists(file)) continue;
     snprintf(label, sizeof(label), "%d", y);
-    o = appendBounded(out, cap, o, "%s\"%s\"", first ? "" : ",", label);
+    o += snprintf(out + o, cap - o, "%s\"%s\"", first ? "" : ",", label);
     first = false;
   }
-  o = appendBounded(out, cap, o, "],\"current\":{\"week\":\"%s\",\"month\":\"%s\",\"year\":\"%s\"}}",
+  o += snprintf(out + o, cap - o, "],\"current\":{\"week\":\"%s\",\"month\":\"%s\",\"year\":\"%s\"}}",
                 state::weekLabel(), state::monthLabel(), state::yearLabel());
   return o;
 }
 
 static size_t buildStatsCurrentJson(char* out, size_t cap) {
-  // The three periods must not live inside `out`: snprintf would be reading the
-  // %s arguments from the same bytes it is writing. Serialising into stack
-  // buffers first keeps source and destination disjoint.
-  char w[640], m[640], y[640];
-  state::week().toJson(w, sizeof(w), state::weekLabel());
-  state::month().toJson(m, sizeof(m), state::monthLabel());
-  state::year().toJson(y, sizeof(y), state::yearLabel());
-  return snprintf(out, cap, "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
-}
-
-// Newest-first tail of the device log, as the console page expects.
-static size_t buildConsoleJson(char* out, size_t cap) {
-  size_t o = 0;
-  o = appendBounded(out, cap, o, "{\"entries\":[");
-
-  File f = fsx::vol().open("/logs/errors.log", FILE_READ);
-  if (f) {
-    std::string raw;
-    if (fsx::readAll("/logs/errors.log", raw, 8 * 1024) && raw.size()) {
-      // Split on newlines and walk backwards so the newest entries land first.
-      std::vector<std::string> lines;
-      size_t start = 0;
-      for (size_t i = 0; i <= raw.size(); ++i) {
-        if (i == raw.size() || raw[i] == '\n') {
-          if (i > start) lines.push_back(raw.substr(start, i - start));
-          start = i + 1;
-        }
-      }
-      int emitted = 0;
-      for (size_t i = lines.size(); i-- > 0 && emitted < kConsoleLines; ) {
-        const std::string& line = lines[i];
-        if (line.empty()) continue;
-        if (emitted++) o = appendBounded(out, cap, o, ",");
-        char msg[256], ts[48];
-        util::jsonEscape(line.c_str(), msg, sizeof(msg));
-        snprintf(ts, sizeof(ts), "%s", msg);
-        o = appendBounded(out, cap, o,
-                          "{\"key\":\"%d\",\"level\":\"error\",\"text\":\"%s\"}",
-                          emitted, ts);
-      }
-    }
-    f.close();
-  }
-  o = appendBounded(out, cap, o, "]}");
-  return o;
+  // Each period is serialised into its own slice of the caller-supplied buffer
+  // rather than three stack locals, which is 1.9KB the loop task cannot spare.
+  const size_t slice = (cap - 32) / 3;
+  char* w = out;
+  char* m = w + slice;
+  char* y = m + slice;
+  state::week().toJson(w, slice, state::weekLabel());
+  state::month().toJson(m, slice, state::monthLabel());
+  state::year().toJson(y, slice, state::yearLabel());
+  return snprintf(out + (cap - 32) * 0 + 0, cap,
+                  "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
 }
 
 // Newest-first page of approved guestbook entries.
@@ -615,7 +476,7 @@ static size_t buildGuestbookEntriesJson(char* out, size_t cap, int pageNo,
   if (matchingOut) *matchingOut = matching;
 
   size_t o = 0;
-  o = appendBounded(out, cap, o, "{\"entries\":[");
+  o += snprintf(out + o, cap - o, "{\"entries\":[");
   int emitted = 0;
   const int offset = (pageNo - 1) * static_cast<int>(kPageSize);
   walkEntries(true, [&](const Row* row) {
@@ -633,32 +494,32 @@ static size_t buildGuestbookEntriesJson(char* out, size_t cap, int pageNo,
       return true;
     });
 
-    if (emitted++) o = appendBounded(out, cap, o, ",");
+    if (emitted++) o += snprintf(out + o, cap - o, ",");
     emitEntry(*row, out, cap, &o, false);
-    o = appendBounded(out, cap, o, ",\"reply_count\":%d", replyCount);
+    o += snprintf(out + o, cap - o, ",\"reply_count\":%d", replyCount);
     if (replyCount >= 1 && replyCount <= 2) {
-      o = appendBounded(out, cap, o, ",\"preview_replies\":[");
+      o += snprintf(out + o, cap - o, ",\"preview_replies\":[");
       int pre = 0;
       walkEntries(true, [&](const Row* other) {
         if (pre >= 2) return false;
         if (strcmp(other->replyTo, row->id) != 0) return true;
-        if (pre++) o = appendBounded(out, cap, o, ",");
+        if (pre++) o += snprintf(out + o, cap - o, ",");
         emitEntry(*other, out, cap, &o, true);
         return true;
       });
-      o = appendBounded(out, cap, o, "]");
+      o += snprintf(out + o, cap - o, "]");
     }
-    o = appendBounded(out, cap, o, "}");
+    o += snprintf(out + o, cap - o, "}");
     return true;
   });
 
   const bool hasMore = (offset + emitted) < totalApproved;
-  o = appendBounded(out, cap, o, "],\"hasMore\":%s,\"total\":%d,\"countries\":%d",
+  o += snprintf(out + o, cap - o, "],\"hasMore\":%s,\"total\":%d,\"countries\":%d",
                 hasMore ? "true" : "false", totalApproved, countryCount);
   if (needle.length()) {
-    o = appendBounded(out, cap, o, ",\"matching\":%d}", matching);
+    o += snprintf(out + o, cap - o, ",\"matching\":%d}", matching);
   } else {
-    o = appendBounded(out, cap, o, "}");
+    o += snprintf(out + o, cap - o, "}");
   }
   return o;
 }
@@ -667,10 +528,10 @@ static void xmlEscape(const char* in, char* out, size_t cap) {
   size_t o = 0;
   for (const char* p = in; *p && o + 7 < cap; ++p) {
     switch (*p) {
-      case '&': o = appendBounded(out, cap, o, "&amp;"); break;
-      case '<': o = appendBounded(out, cap, o, "&lt;"); break;
-      case '>': o = appendBounded(out, cap, o, "&gt;"); break;
-      case '"': o = appendBounded(out, cap, o, "&quot;"); break;
+      case '&': o += snprintf(out + o, cap - o, "&amp;"); break;
+      case '<': o += snprintf(out + o, cap - o, "&lt;"); break;
+      case '>': o += snprintf(out + o, cap - o, "&gt;"); break;
+      case '"': o += snprintf(out + o, cap - o, "&quot;"); break;
       default: out[o++] = *p;
     }
   }
@@ -679,7 +540,7 @@ static void xmlEscape(const char* in, char* out, size_t cap) {
 
 static size_t buildGuestbookRss(char* out, size_t cap) {
   size_t o = 0;
-  o = appendBounded(out, cap, o,
+  o += snprintf(out + o, cap - o,
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\">\n<channel>\n"
       "<title>HelloESP guestbook</title>\n<link>/guestbook</link>\n<description>Recent messages</description>\n");
   int n = 0;
@@ -696,14 +557,14 @@ static size_t buildGuestbookRss(char* out, size_t cap) {
     xmlEscape(title, body, sizeof(body));
     char msg[256], safe[512];
     xmlEscape(row->message, msg, sizeof(msg));
-    o = appendBounded(out, cap, o,
+    o += snprintf(out + o, cap - o,
         "<item><title>%s</title><link>/guestbook#%s</link>"
         "<guid>gb-%s</guid><pubDate>%s</pubDate><description>%s</description></item>\n",
         body, row->id, row->id, row->time, msg);
     (void)safe;
     return true;
   });
-  o = appendBounded(out, cap, o, "</channel>\n</rss>\n");
+  o += snprintf(out + o, cap - o, "</channel>\n</rss>\n");
   return o;
 }
 
@@ -715,7 +576,7 @@ static size_t buildGuestbookRss(char* out, size_t cap) {
 // of those pile up to exhaust lwIP's MEMP_SYS_TIMEOUT pool - which aborts the
 // chip inside sys_timeout(). So every branch below terminates in a response,
 // and the fallback answers 404 rather than falling silent.
-static char g_relayBuf[3800];
+static char g_relayBuf[4400];
 
 void handleRelayedRequest(int32_t id, const char* method, const char* path,
                           const char* body) {
@@ -732,33 +593,10 @@ void handleRelayedRequest(int32_t id, const char* method, const char* path,
   auto sendAsset = [&](const char* file, const char* cc) {
     char gz[160];
     snprintf(gz, sizeof(gz), "%s.gz", file);
-    if (fsx::exists(gz)) {
-      relay::sendFile(id, gz, "text/html", "gzip", cc);
-    } else if (fsx::exists(file)) {
-      relay::sendFile(id, file, mimeFor(file), nullptr, cc);
-    } else {
-      relay::sendFile(id, "/404.html", "text/html", nullptr, "no-store");
-    }
+    if (fsx::exists(gz)) relay::sendFile(id, gz, "text/html", "gzip", cc);
+    else if (fsx::exists(file)) relay::sendFile(id, file, "text/html", nullptr, cc);
+    else relay::sendFile(id, "/404.html", "text/html", nullptr, "no-store");
   };
-
-  // Root-level images the pages reference by absolute path. There is no route
-  // per file, so they are matched by extension here, exactly as on the LAN.
-  const bool isImage = strcmp(path, "/favicon.ico") == 0 ||
-                       strstr(path, ".jpg") != nullptr ||
-                       strstr(path, ".jpeg") != nullptr ||
-                       strstr(path, ".png") != nullptr ||
-                       strstr(path, ".svg") != nullptr ||
-                       strstr(path, ".webp") != nullptr ||
-                       strstr(path, ".gif") != nullptr;
-  if (strcmp(path, "/favicon.ico") == 0) {
-    sendAsset("/favicon.svg", "public, max-age=86400");
-    return;
-  }
-  if (isImage && strchr(path + 1, '/') == nullptr &&
-      strncmp(path, "/fw", 3) != 0) {
-    sendAsset(path, "public, max-age=3600");
-    return;
-  }
 
   // Relayed traffic has already been filtered by the Worker, so it is public
   // traffic by definition and every hit counts.
@@ -826,15 +664,14 @@ void handleRelayedRequest(int32_t id, const char* method, const char* path,
   }
 
   if (strcmp(path, "/console.json") == 0) {
-    buildConsoleJson(g_relayBuf, sizeof(g_relayBuf));
-    sendJsonBuf(g_relayBuf, "no-store");
+    // The console log is now Worker-side; the device has no per-request log.
+    sendJsonBuf("{\"entries\":[]}", "no-store");
     return;
   }
 
   if (strcmp(path, "/adsb.json") == 0) {
-    // The Worker tracks and shapes the fleet; this is the fallback it relays
-    // for when its own cache is cold, so return the same compact shape.
-    sendJsonBuf(adsb::lastJson(), "no-store");
+    // Tracking moved to the Worker; the page self-hides on an empty fleet.
+    sendJsonBuf("{\"now\":0,\"aircraft\":[]}", "no-store");
     return;
   }
 
@@ -909,8 +746,6 @@ void handleRelayedRequest(int32_t id, const char* method, const char* path,
   sendText(404, "not found", "text/plain", "no-store");
 }
 
-static char g_lanBuf[3800];
-
 // --- routes ---------------------------------------------------------------
 
 
@@ -968,28 +803,26 @@ void begin() {
   // --- dashboard payload ---
   g_server.on("/stats", HTTP_GET, [](AsyncWebServerRequest* r) {
     
-    if (buildStatsJsonRaw(g_lanBuf, sizeof(g_lanBuf))) sendJson(r, g_lanBuf, "no-store");
+    if (buildStatsJsonRaw(g_relayBuf, sizeof(g_relayBuf))) sendJson(r, g_relayBuf, "no-store");
     else sendText(r, 500, "stats unavailable");
   });
 
   // The Shelly/ADS-B features are gone. Both endpoints stay registered and
   // report an empty, valid shape so the pages self-hide instead of erroring.
   g_server.on("/adsb.json", HTTP_GET, [](AsyncWebServerRequest* r) {
-    // Served from the payload adsb::tick() already built, so this costs no
-    // network round trip and answers even between polls.
-    sendJson(r, adsb::lastJson(), "no-store");
+    sendJson(r, "{\"now\":0,\"aircraft\":[]}", "no-store");
   });
 
   g_server.on("/records.json", HTTP_GET, [](AsyncWebServerRequest* r) {
     
-    state::recordsJson(g_lanBuf, sizeof(g_lanBuf));
-    sendJson(r, g_lanBuf, "public, max-age=300");
+    state::recordsJson(g_relayBuf, sizeof(g_relayBuf));
+    sendJson(r, g_relayBuf, "public, max-age=300");
   });
 
   g_server.on("/countries", HTTP_GET, [](AsyncWebServerRequest* r) {
     
     size_t o = 0;
-    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "{");
+    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "{");
     std::string raw;
     if (fsx::readAll("/countries.csv", raw, 4096)) {
       const char* p = raw.c_str();
@@ -1004,7 +837,7 @@ void begin() {
           char* cr = strchr(line, '\r');
           if (cr) *cr = '\0';
           if (line[2] == ',') {
-            o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "%s\"%c%c\":%s",
+            o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "%s\"%c%c\":%s",
                           first ? "" : ",", line[0], line[1], line + 3);
             first = false;
           }
@@ -1013,20 +846,19 @@ void begin() {
         p = eol + 1;
       }
     }
-    snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "}");
-    sendJson(r, g_lanBuf, "public, max-age=60");
+    snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "}");
+    sendJson(r, g_relayBuf, "public, max-age=60");
   });
 
   g_server.on("/console.json", HTTP_GET, [](AsyncWebServerRequest* r) {
-    buildConsoleJson(g_lanBuf, sizeof(g_lanBuf));
-    sendJson(r, g_lanBuf, "no-store");
+    sendJson(r, "{\"entries\":[]}", "no-store");
   });
 
   // --- history ---
   g_server.on("/history.json", HTTP_GET, [](AsyncWebServerRequest* r) {
     
     size_t o = 0;
-    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "{\"weekly\":[");
+    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "{\"weekly\":[");
     // Archives live at /stats/{weekly,monthly}/<year>/<label>.json; the API
     // flattens the year directory away.
     auto emitList = [&](const char* kind, bool* first) {
@@ -1048,7 +880,7 @@ void begin() {
           else snprintf(label, sizeof(label), "%d-%02d", y, w);
           snprintf(file, sizeof(file), "%s/%s.json", dir, label);
           if (!fsx::exists(file)) continue;
-          o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "%s\"%s\"", *first ? "" : ",", label);
+          o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "%s\"%s\"", *first ? "" : ",", label);
           *first = false;
         }
       }
@@ -1056,23 +888,23 @@ void begin() {
     };
     bool first = true;
     emitList("weekly", &first);
-    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "],\"monthly\":[");
+    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "],\"monthly\":[");
     first = true;
     emitList("monthly", &first);
-    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "],\"yearly\":[");
+    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "],\"yearly\":[");
     first = true;
     for (int y = 2020; y <= 2100; ++y) {
       char file[64], label[8];
       snprintf(file, sizeof(file), "/stats/yearly/%d.json", y);
       if (!fsx::exists(file)) continue;
       snprintf(label, sizeof(label), "%d", y);
-      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "%s\"%s\"", first ? "" : ",", label);
+      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "%s\"%s\"", first ? "" : ",", label);
       first = false;
     }
-    snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
+    snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o,
              "],\"current\":{\"week\":\"%s\",\"month\":\"%s\",\"year\":\"%s\"}}",
              state::weekLabel(), state::monthLabel(), state::yearLabel());
-    sendJson(r, g_lanBuf, "public, max-age=300");
+    sendJson(r, g_relayBuf, "public, max-age=300");
   });
 
   g_server.on("/stats/current", HTTP_GET, [](AsyncWebServerRequest* r) {
@@ -1081,13 +913,13 @@ void begin() {
     state::week().toJson(w, sizeof(w), state::weekLabel());
     state::month().toJson(m, sizeof(m), state::monthLabel());
     state::year().toJson(y, sizeof(y), state::yearLabel());
-    snprintf(g_lanBuf, sizeof(g_lanBuf), "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
-    sendJson(r, g_lanBuf, "public, max-age=300");
+    snprintf(g_relayBuf, sizeof(g_relayBuf), "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
+    sendJson(r, g_relayBuf, "public, max-age=300");
   });
 
   // Archive passthrough with an immutable cache header: these never change
   // once written.
-  g_server.on("/stats/weekly/*", HTTP_GET, [](AsyncWebServerRequest* r) {
+  g_server.on("/stats/weekly/", HTTP_GET, [](AsyncWebServerRequest* r) {
     const String label = r->url().substring(strlen("/stats/weekly/"));
     if (label.length() != 8 || label.indexOf("..") >= 0 || label.indexOf('/') >= 0) {
       sendText(r, 400, "bad label");
@@ -1107,7 +939,7 @@ void begin() {
     sendJson(r, body.c_str(), "public, max-age=31536000, immutable");
   });
 
-  g_server.on("/stats/monthly/*", HTTP_GET, [](AsyncWebServerRequest* r) {
+  g_server.on("/stats/monthly/", HTTP_GET, [](AsyncWebServerRequest* r) {
     const String label = r->url().substring(strlen("/stats/monthly/"));
     if (label.length() != 7 || label.indexOf("..") >= 0 || label.indexOf('/') >= 0) {
       sendText(r, 400, "bad label");
@@ -1168,7 +1000,7 @@ void begin() {
     });
 
     size_t o = 0;
-    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "{\"entries\":[");
+    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "{\"entries\":[");
     int emitted = 0;
     walkEntries(true, [&](const Row* row) {
       if (needle.length() && !util::containsCI(row->name, needle.c_str()) &&
@@ -1190,36 +1022,36 @@ void begin() {
         return true;
       });
 
-      if (emitted++) o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",");
-      emitEntry(*row, g_lanBuf, sizeof(g_lanBuf), &o, false);
-      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",\"reply_count\":%d", replyCount);
+      if (emitted++) o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",");
+      emitEntry(*row, g_relayBuf, sizeof(g_relayBuf), &o, false);
+      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",\"reply_count\":%d", replyCount);
       if (replyCount >= 1 && replyCount <= 2) {
-        o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",\"preview_replies\":[");
+        o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",\"preview_replies\":[");
         int pre = 0;
         walkEntries(true, [&](const Row* other) {
           if (pre >= 2) return false;
           if (strcmp(other->replyTo, row->id) != 0) return true;
-          if (pre++) o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",");
-          emitEntry(*other, g_lanBuf, sizeof(g_lanBuf), &o, true);
+          if (pre++) o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",");
+          emitEntry(*other, g_relayBuf, sizeof(g_relayBuf), &o, true);
           return true;
         });
-        o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "]");
+        o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "]");
       }
-      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "}");
+      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "}");
       return true;
     });
 
     const int offset = (pageNo - 1) * static_cast<int>(kPageSize);
     const bool hasMore = (offset + emitted) < totalApproved;
-    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o,
+    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o,
                   "],\"hasMore\":%s,\"total\":%d,\"countries\":%d",
                   hasMore ? "true" : "false", totalApproved, countryCount);
     if (q.length()) {
-      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",\"matching\":%d}", matching);
+      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",\"matching\":%d}", matching);
     } else {
-      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "}");
+      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "}");
     }
-    sendJson(r, g_lanBuf, q.length() ? nullptr : "public, max-age=30");
+    sendJson(r, g_relayBuf, q.length() ? nullptr : "public, max-age=30");
   });
 
   g_server.on("/guestbook/submit", HTTP_POST, [](AsyncWebServerRequest* r) {
@@ -1261,7 +1093,7 @@ void begin() {
     const size_t usedBytes = fsx::usedBytes();
     const size_t totalBytes = fsx::totalBytes();
 
-    snprintf(g_lanBuf, sizeof(g_lanBuf),
+    snprintf(g_relayBuf, sizeof(g_relayBuf),
         "{\"firmware\":\"%s\",\"chip_model\":\"%s\",\"chip_revision\":%d,"
         "\"cpu_freq_mhz\":%d,\"flash_size_mb\":%.1f,\"sdk_version\":\"%s\","
         "\"time_t_bytes\":%d,\"mac_address\":\"%s\",\"local_ip\":\"%s\","
@@ -1292,7 +1124,7 @@ void begin() {
         static_cast<unsigned long>(usedBytes), static_cast<unsigned long>(totalBytes),
         sensors::bmeRetired() ? "true" : "false",
         sensors::ccsRetired() ? "true" : "false");
-    sendJson(r, g_lanBuf, nullptr);
+    sendJson(r, g_relayBuf, nullptr);
   });
 
   g_server.on("/admin/export", HTTP_GET, [](AsyncWebServerRequest* r) {
@@ -1360,30 +1192,30 @@ void begin() {
     }
     
     size_t o = 0;
-    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "{\"entries\":[");
+    o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, "{\"entries\":[");
     int shown = 0;
     int idx = 0;
     walkEntries(false, [&](const Row* row) {
       const int myIdx = idx++;
       if (row->status != '0') return true;
       if (shown >= static_cast<int>(kPageSize)) return false;
-      if (shown++) o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",");
+      if (shown++) o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o, ",");
       char m[256] = "", n[48] = "", t[40] = "";
       util::jsonEscape(row->message, m, sizeof(m));
       util::jsonEscape(row->name, n, sizeof(n));
       util::jsonEscape(row->time, t, sizeof(t));
-      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o,
+      o += snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o,
                     "{\"idx\":%d,\"time\":\"%s\",\"country\":\"%s\",\"name\":\"%s\","
                     "\"message\":\"%s\",\"id\":\"%s\",\"reply_to\":\"%s\",\"approved\":0}",
                     myIdx, t, row->country, n, m, row->id, row->replyTo);
       return true;
     });
-    snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
+    snprintf(g_relayBuf + o, sizeof(g_relayBuf) - o,
              "],\"hasMore\":false,\"counts\":{\"new\":%u,\"approved\":%u,\"denied\":0,\"all\":%u}}",
              static_cast<unsigned>(guestbook::pendingCount()),
              static_cast<unsigned>(guestbook::approvedCount()),
              static_cast<unsigned>(guestbook::allCount()));
-    sendJson(r, g_lanBuf, nullptr);
+    sendJson(r, g_relayBuf, nullptr);
   });
 
   g_server.on("/guestbook/moderate-batch", HTTP_POST, [](AsyncWebServerRequest* r) {
@@ -1446,28 +1278,14 @@ void begin() {
     sendText(r, 200, "sensor retirement cleared");
   });
 
-  // Static assets that live at the filesystem root and are referenced directly by
-// the pages: photos, favicons, the Open Graph banner. There is no route per
-// file, so they are matched by extension here.
-g_server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest* r) {
-    sendAsset(r, "/favicon.svg", "public, max-age=86400");
-  });
-
-g_server.onNotFound([](AsyncWebServerRequest* r) {
-    // Genuinely unknown paths only. This must not hijack /stats/*: doing so
-    // shadowed /stats/current and served the dashboard blob in its place.
-    if (r->method() == HTTP_GET) {
-      const String url = r->url();
-      // Root-level images the pages reference by absolute path. Restricted to a
-      // known extension set and to a single path segment so this cannot be used
-      // to read arbitrary files such as /config.txt.
-      const bool isImage = url.endsWith(".jpg") || url.endsWith(".jpeg") ||
-                           url.endsWith(".png") || url.endsWith(".svg") ||
-                           url.endsWith(".webp") || url.endsWith(".gif") ||
-                           url.endsWith(".ico");
-      if (isImage && url.indexOf('/') == 0 && url.lastIndexOf('/') == 0 &&
-          !url.startsWith("/fw")) {
-        sendAsset(r, url.c_str(), "public, max-age=3600");
+  g_server.onNotFound([](AsyncWebServerRequest* r) {
+    // AsyncWebServer prefix-matches, so /stats/* never reaches the explicit
+    // routes above; this is where those fall through.
+    const String url = r->url();
+    if (url.startsWith("/stats/") || url == "/stats") {
+      
+      if (buildStatsJsonRaw(g_relayBuf, sizeof(g_relayBuf))) {
+        sendJson(r, g_relayBuf, "no-store");
         return;
       }
     }
