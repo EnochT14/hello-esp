@@ -272,6 +272,71 @@ bool oledOk = false;             // set true after OLED init; cleared on init fa
 // SD.* — this shim reroutes it to flash. Populate with `pio run -t uploadfs`.
 fs::LittleFSFS SD;
 
+// --- LittleFS corruption crash-loop guard -------------------------------
+// A power cut can tear the filesystem's directory metadata while leaving the
+// superblock intact. LittleFS then MOUNTS SUCCESSFULLY and small writes
+// succeed, but the first write that must EXTEND an existing file's CTZ
+// skip-list faults inside lfs_alloc() (lfs.c:689) with an unhandled
+// IntegerDivideByZero. That is a CPU exception, not a LittleFS error code, so
+// it cannot be caught in-process: the only way out is to recognise it on the
+// NEXT boot. Unhandled, the device reboots forever and never serves the site.
+//
+// An earlier attempt probed the filesystem with a small write at boot. That
+// was WRONG and has been removed: it passed on a filesystem that still
+// panicked minutes later on the boot-gap append, because creating and
+// deleting a tiny file never reaches the extending write that actually
+// faults. Probing storage is unreliable.
+//
+// So detect the SYMPTOM instead, which is what we actually care about: the
+// device is restarting without ever reaching a running state. We arm a magic
+// stamp in RTC_NOINIT_ATTR at the top of setup() and disarm it at the bottom.
+// A panic (IntegerDivideByZero, watchdog, Brownout detector) restarts the chip
+// through esp_restart(), which preserves RTC memory; a real power cut clears
+// it. So "stamp still armed on entry" means "the previous boot never
+// finished", and two of those in a row means we are in a panic loop and the
+// filesystem must not be written to again.
+//
+// The recovery is deliberately NOT a format: formatting would destroy the web
+// assets and every counter, turning a recoverable incident into a wipe. Reads
+// keep working, so the device suspends persistence and keeps serving the
+// site read-only until an uploadfs repairs the partition.
+#define FS_CRASH_MARKER   0xA5C0FFEEUL
+#define FS_CRASH_LIMIT    2
+// Magic VALUE, not a boolean: RTC memory is not zero-initialised on first
+// use, so arbitrary garbage must not read as "previous boot crashed".
+RTC_NOINIT_ATTR uint32_t rtcSetupStamp   = 0;
+RTC_NOINIT_ATTR uint32_t rtcFsCrashCount = 0;
+// True when the device is known to be in a panic loop: background writes are
+// skipped. Set before setup() runs any filesystem write.
+bool fsWritesSuspended = false;
+
+// True when persistence must be skipped. Safe to call from any context.
+static inline bool fsWriteBlocked() { return fsWritesSuspended; }
+
+// Decide, before touching the filesystem, whether this boot is a repeat of a
+// crashed one. Call at the very top of setup().
+static void fsCrashGuardArm() {
+    if (rtcSetupStamp == FS_CRASH_MARKER) {
+        rtcFsCrashCount++;
+        Serial.printf("Boot %u: previous boot did NOT finish (panic loop, consecutive=%u)\n",
+                      (unsigned)rtcFsCrashCount + 1, (unsigned)rtcFsCrashCount);
+    } else {
+        // Clean entry (fresh power cycle, or uninitialised RTC memory).
+        rtcFsCrashCount = 0;
+    }
+    rtcSetupStamp = FS_CRASH_MARKER;  // armed until setup() finishes
+
+    if (rtcFsCrashCount >= FS_CRASH_LIMIT) {
+        fsWritesSuspended = true;
+        Serial.println("Filesystem writes SUSPENDED: repeated panic reboots detected. "
+                       "Site is read-only; run `pio run -t uploadfs` to repair.");
+    }
+}
+
+// Called once setup() has completed and the main loop is about to take over.
+static void fsCrashGuardDisarm() { rtcSetupStamp = 0; }
+
+
 // All cached sensor values + degraded-at timestamps are written from the
 // main loop and read from HTTP handlers running on the AsyncTCP task
 // (separate FreeRTOS task, often pinned to the other core). Without
@@ -486,6 +551,7 @@ static void loadSensorHealth() {
 }
 
 static void saveSensorHealth() {
+    if (fsWriteBlocked()) return;
     String json;
     json.reserve(256);
     json  = "{\n  \"bme280\": {\"retired\": ";
@@ -658,6 +724,7 @@ static String periodToJson(const char* label, const PeriodStats& p, float energy
 // the period's accumulated Shelly energy (when configured). Defaults to
 // -1 (omitted) so legacy callers that don't track energy stay correct.
 static bool flushPeriod(const char* dir, const char* label, const PeriodStats& p, float energy_wh = -1.0f) {
+    if (fsWriteBlocked()) return false;
     String path = String(dir) + "/" + label + ".json";
     String tmp  = path + ".tmp";
     String bak  = path + ".bak";
@@ -851,6 +918,7 @@ static size_t checkpointV2Size() {
 }
 
 static void saveCheckpoint() {
+    if (fsWriteBlocked()) return;
     const char* path = "/stats/checkpoint.bin";
     const char* tmp  = "/stats/checkpoint.tmp";
     const char* bak  = "/stats/checkpoint.bak";
@@ -1014,6 +1082,7 @@ RecordVal rec_lowest_temp_f     = { 0,    "", false };
 RecordVal rec_most_visitors_day = { 0,    "", false };
 RecordVal rec_longest_uptime_d  = { 0,    "", false };
 static void saveRecords() {
+    if (fsWriteBlocked()) return;
     const char* path = "/stats/records.json";
     const char* tmp  = "/stats/records.tmp";
     const char* bak  = "/stats/records.bak";
@@ -1384,6 +1453,10 @@ volatile unsigned long lastUploadChunkMs          = 0;
 // the request didn't include overwrite=1; the completion handler reads it to
 // reply 409 instead of 200, so a misclick can't silently clobber index.html.
 bool uploadRejectedExisting                       = false;
+// Set when the target could not be opened because the filesystem is in
+// safe mode (torn metadata). The completion handler turns this into a 503 so
+// the admin UI reports "reflash the filesystem" instead of a bare 500.
+bool uploadFailedReadonly                        = false;
 // Window after the last chunk during which we still suppress WS work
 // (reads, pings, reconnects). Covers both "upload still in flight" between
 // chunks and a grace period for AsyncTCP to finalize the HTTP response
@@ -1645,6 +1718,7 @@ void loadCountries() {
 }
 
 void saveCountries() {
+    if (fsWriteBlocked()) return;
     File tmp = SD.open("/countries.tmp", FILE_WRITE);
     if (!tmp) return;
     for (int i = 0; i < countryCount; i++) {
@@ -2024,6 +2098,7 @@ static time_t dumsorReadLastSeen() {
 
 static void dumsorWriteLastSeen(time_t t) {
     if (t <= 0) return;
+    if (fsWriteBlocked()) return;
     File f = SD.open(LASTSEEN_PATH, FILE_WRITE);
     if (!f) return;
     f.printf("%lld\n", (long long)t);
@@ -2032,6 +2107,7 @@ static void dumsorWriteLastSeen(time_t t) {
 
 // Append one outage row and keep the file bounded (header + newest rows).
 static void dumsorAppendEvent(time_t from, time_t to, uint32_t secs) {
+    if (fsWriteBlocked()) return;
     File f = SD.open(POWER_EVENTS_CSV, FILE_APPEND);
     if (!f) {
         logError("dumsor", "power_events.csv append failed");
@@ -2190,6 +2266,9 @@ void logError(const char* tag, const char* msg) {
     if (!msg) msg = "";
     // always mirror to serial for live debugging
     Serial.printf("[err] %s | %s\n", tag, msg);
+    // Safe mode: serial only. Writing here is precisely what panics on a
+    // torn filesystem, and logError is on the boot crash path.
+    if (fsWriteBlocked()) return;
     // rate-limit: max 5 writes per second to guard against crash-loop spam
     static unsigned long windowMs = 0;
     static int windowCount = 0;
@@ -2230,6 +2309,7 @@ int readVisitorCount() {
 }
 
 void writeVisitorCount(int count) {
+    if (fsWriteBlocked()) return;
     File tmp = SD.open("/visitors.tmp", FILE_WRITE);
     if (!tmp) return;
     tmp.println(count);
@@ -2950,6 +3030,7 @@ void loadDailyVisitors() {
 }
 
 void saveDailyVisitors() {
+    if (fsWriteBlocked()) return;
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) return;
     char today[12];
@@ -3015,6 +3096,7 @@ SensorData readSensors() {
 
 // CSV logging
 void logStats() {
+    if (fsWriteBlocked()) return;
     // Skip entirely if NTP isn't synced yet. Otherwise getLogFilename()
     // returns "/logs/fallback.csv" which never gets migrated to a dated file
     // and is invisible to /logs viewers (filename doesn't match
@@ -3412,6 +3494,7 @@ void loadLastBackupDate() {
 }
 
 static void saveLastBackupDate(const char* date) {
+    if (fsWriteBlocked()) return;
     File f = SD.open(LAST_BACKUP_TMP, FILE_WRITE);
     if (!f) return;
     f.print(date);
@@ -3425,6 +3508,7 @@ static void saveLastBackupDate(const char* date) {
 // directory is mutated while being iterated. errors.log / .old are capped
 // by their own 64KB rotation and are left alone.
 static void pruneOldLogs() {
+    if (fsWriteBlocked()) return;
     struct tm tm;
     if (!getLocalTime(&tm, 0)) return;
     time_t cut = mktime(&tm) - (time_t)LOG_RETAIN_DAYS * 86400;
@@ -3528,6 +3612,7 @@ void loadMaintenanceState() {
 }
 
 static void saveMaintenanceState() {
+    if (fsWriteBlocked()) return;
     if (localMaintenanceUntilUnix == 0) {
         if (SD.exists(MAINTENANCE_STATE_PATH)) SD.remove(MAINTENANCE_STATE_PATH);
         if (SD.exists(MAINTENANCE_STATE_TMP)) SD.remove(MAINTENANCE_STATE_TMP);
@@ -3573,6 +3658,7 @@ void loadLastCommit() {
 }
 
 static void saveLastCommit() {
+    if (fsWriteBlocked()) return;
     if (SD.exists(LAST_COMMIT_TMP)) SD.remove(LAST_COMMIT_TMP);
     File f = SD.open(LAST_COMMIT_TMP, FILE_WRITE);
     if (!f) return;
@@ -4244,6 +4330,13 @@ bool connectWorker() {
 void setup() {
     Serial.begin(115200);
 
+    // Crash-loop guard: must run before ANY filesystem write. If the previous
+    // boot never reached the end of setup() we may be looping on a torn
+    // filesystem, in which case every write is fatal — suspend them now rather
+    // than panic our way round the loop again. See the guard's definition
+    // above fs::LittleFSFS SD.
+    fsCrashGuardArm();
+
     // Notification LED (GPIO2 onboard blue LED, active-low: LOW = on). 3 quick
     // blinks at boot.
     pinMode(LED_PIN, OUTPUT);
@@ -4327,8 +4420,11 @@ void setup() {
     // (last chance) is the bare-minimum 1MHz startup speed.
     // On-chip LittleFS (no SD slot on this board). Populate the partition
     // with `pio run -t uploadfs`; config.txt + web assets come from data/.
-    // formatOnFail=true keeps a corrupted partition from bricking the device
-    // into a boot loop — config/stats are re-uploadable.
+    // formatOnFail=true only rescues a bad SUPERBLOCK. A torn directory
+    // pair still mounts cleanly AND small writes still succeed, so mount
+    // success and a write probe are both useless as corruption signals. See
+    // the crash-loop guard near the top of this file: it watches for
+    // repeated panic reboots instead, and arms before any write happens.
     bootLog("[fs] mounting littlefs");
     bool sdMounted = SD.begin(true);
     if (sdMounted) {
@@ -4341,6 +4437,9 @@ void setup() {
         // The 60s delay gives the OLED time to display the failure.
         delay(60000);
         ESP.restart();
+    }
+    if (fsWriteBlocked()) {
+        bootLog("[fs] WRITES SUSPENDED (panic loop)");
     }
 
     // Ensure /fw/ directory exists for firmware staging (SD-flash feature).
@@ -5009,6 +5108,13 @@ void setup() {
                 request->send(409, "text/plain", "File exists; resubmit with overwrite=1 to replace");
                 return;
             }
+            if (uploadFailedReadonly) {
+                uploadFailedReadonly = false;
+                request->send(503, "text/plain",
+                    "Storage is read-only: filesystem metadata is torn. "
+                    "Reflash the filesystem (`pio run -t uploadfs`) to re-enable writes.");
+                return;
+            }
             request->send(200, "text/plain", "OK");
         },
         [](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
@@ -5034,6 +5140,14 @@ void setup() {
                 if (SD.exists(fullPath) && !wantOverwrite) {
                     uploadRejectedExisting = true;
                     Serial.println("Upload rejected (exists, no overwrite): " + fullPath);
+                    return;
+                }
+                // Safe mode: refuse rather than fault. The metadata is torn,
+                // so the write would panic and take the site down.
+                if (fsWriteBlocked()) {
+                    uploadFailedReadonly = true;
+                    Serial.println("Upload rejected: filesystem writes suspended "
+                                   "(torn metadata); run `pio run -t uploadfs`");
                     return;
                 }
                 uploadFile = SD.open(fullPath, FILE_WRITE);
@@ -6290,6 +6404,13 @@ void setup() {
                 }
             }
 
+            if (fsWriteBlocked()) {
+                request->send(503, "text/plain",
+                    "Storage is read-only: filesystem metadata is torn. "
+                    "Reflash the filesystem (`pio run -t uploadfs`) to re-enable writes.");
+                return;
+            }
+
             File f = SD.open("/guestbook.csv", FILE_APPEND);
             if (!f) {
                 logError("sd", "guestbook.csv append failed");
@@ -6617,6 +6738,13 @@ void setup() {
 
             File f = SD.open("/guestbook.csv", FILE_READ);
             if (!f) { request->send(500, "text/plain", "Read failed"); return; }
+            if (fsWriteBlocked()) {
+                f.close();
+                request->send(503, "text/plain",
+                    "Storage is read-only: filesystem metadata is torn. "
+                    "Reflash the filesystem (`pio run -t uploadfs`) to re-enable writes.");
+                return;
+            }
             File out = SD.open("/guestbook.tmp", FILE_WRITE);
             if (!out) { f.close(); request->send(500, "text/plain", "Write failed"); return; }
 
@@ -6856,6 +6984,11 @@ void setup() {
             json += "\"min_free_heap\":" + String(ESP.getMinFreeHeap()) + ",";
             json += "\"heap_size\":" + String(ESP.getHeapSize()) + ",";
             json += "\"last_reset\":\"" + String(reasonStr) + "\",";
+            // Torn-filesystem guard state. fs_writes_suspended=true means the
+            // device is serving read-only after a power cut corrupted the
+            // LittleFS metadata; `pio run -t uploadfs` clears it.
+            json += "\"fs_writes_suspended\":" + String(fsWritesSuspended ? "true" : "false") + ",";
+            json += "\"fs_crash_count\":" + String((unsigned)rtcFsCrashCount) + ",";
             json += "\"uptime\":\"" + uptime_formatter::getUptime() + "\",";
             json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
             json += "\"tx_power\":" + String(WiFi.getTxPower() / 4.0f, 1) + ",";
@@ -7033,9 +7166,14 @@ void setup() {
             bool sdOk = false;
             String sdDetail = "LittleFS test failed";
             {
+                if (fsWriteBlocked()) {
+                    // Skip the write half rather than faulting on it; report
+                    // the reason instead of a misleading generic failure.
+                    sdDetail = "writes suspended (torn metadata) - run uploadfs";
+                }
                 const char* testPath = "/_selftest.tmp";
                 uint32_t token = (uint32_t)millis();
-                File wf = SD.open(testPath, FILE_WRITE);
+                File wf = fsWriteBlocked() ? File() : SD.open(testPath, FILE_WRITE);
                 if (wf) {
                     wf.println(token);
                     wf.close();
@@ -7402,6 +7540,12 @@ void setup() {
                 if (!rf) {
                     request->send(500, "application/json",
                         "{\"ok\":false,\"error\":\"open read failed\"}");
+                    return;
+                }
+                if (fsWriteBlocked()) {
+                    rf.close();
+                    request->send(503, "application/json",
+                        "{\"ok\":false,\"error\":\"storage read-only: torn filesystem metadata; run uploadfs\"}");
                     return;
                 }
                 File wf = SD.open(tmpPath, FILE_WRITE);
@@ -8030,6 +8174,10 @@ void setup() {
 
     delay(5000);
     lastPageSwitch = millis();
+
+    // setup() completed: the device is not crash-looping. Disarm so a future
+    // panic is counted from zero and this boot's writes stay enabled.
+    fsCrashGuardDisarm();
 }
 
 // If both I2C sensors have been stale past the threshold the bus is probably
