@@ -163,6 +163,8 @@ void onCommitted(const char* date) {
   if (!date) return;
   snprintf(g_lastDate, sizeof(g_lastDate), "%s", date);
   fsx::writeText("/stats/last_backup.txt", g_lastDate);
+  // Only now is it true that R2 holds a snapshot from this firmware.
+  fsx::writeText("/stats/last_backup_ok.txt", FIRMWARE_VERSION_STR);
   g_lastOk = true;
   snprintf(g_lastError, sizeof(g_lastError), "%s", "none");
 }
@@ -171,10 +173,24 @@ void begin() {
   g_running = false;
   g_requested = false;
   g_lastOk = false;
-  snprintf(g_lastError, sizeof(g_lastError), "%s", "none");
+  snprintf(g_lastError, sizeof(g_lastError), "none");
   char buf[16];
+  g_lastDate[0] = '\0';
   if (fsx::readTrimmed("/stats/last_backup.txt", buf, sizeof(buf))) {
     snprintf(g_lastDate, sizeof(g_lastDate), "%s", buf);
+  }
+
+  // After a firmware change the first backup must run even if today's already
+  // ran: the old binary and the new one write different files, so skipping it
+  // would leave R2 holding a snapshot this firmware never produced.
+  // last_backup_ok.txt is written by runOnce() only after the Worker confirms
+  // the R2 write, so "absent" genuinely means "never backed up on this build".
+  char fw[16];
+  if (!fsx::readTrimmed("/stats/last_backup_ok.txt", fw, sizeof(fw)) ||
+      strcmp(fw, FIRMWARE_VERSION_STR) != 0) {
+    Serial.printf("[backup] no confirmed backup on firmware %s, forcing one\n",
+                  FIRMWARE_VERSION_STR);
+    g_lastDate[0] = '\0';
   }
 }
 
