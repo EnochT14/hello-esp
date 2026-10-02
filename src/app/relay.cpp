@@ -91,6 +91,31 @@ void hmacSha256Hex(const char* key, const char* msg, char* out) {
   out[64] = '\0';
 }
 
+// Writes every byte or reports failure. NetworkClientSecure::write() may accept
+// fewer bytes than offered - the TLS record and socket buffers drain in
+// whatever sizes the network hands over - and treating a short write as fatal
+// silently truncated relay responses mid-base64, which the Worker rejected as
+// invalid and dropped. Retrying until the buffer is empty is the only correct
+// behaviour here.
+bool writeAll(const uint8_t* data, size_t len) {
+  size_t sent = 0;
+  unsigned spins = 0;
+  while (sent < len) {
+    const int n = g_tls.write(data + sent, len - sent);
+    if (n > 0) {
+      sent += static_cast<size_t>(n);
+      spins = 0;
+      continue;
+    }
+    // A zero or negative write means the socket buffer is full, not broken.
+    // Back off briefly, but give up eventually so a dead peer cannot wedge the
+    // loop task forever.
+    if (++spins > 200) return false;
+    delay(2);
+  }
+  return true;
+}
+
 // Writes a masked text frame. The mask is a constant because it has no
 // confidentiality role here: TLS already provides that, and a constant keeps
 // the hot path free of randomness.
@@ -117,8 +142,8 @@ bool writeFrame(const char* payload, size_t len) {
     headerLen = 10;
   }
   g_lastActivity = millis();
-  if (g_tls.write(header, headerLen) != headerLen) return false;
-  if (g_tls.write(kMask, 4) != 4) return false;
+  if (!writeAll(header, headerLen)) return false;
+  if (!writeAll(kMask, 4)) return false;
 
   uint8_t chunk[512];
   size_t sent = 0;
@@ -127,7 +152,7 @@ bool writeFrame(const char* payload, size_t len) {
     for (size_t i = 0; i < n; ++i) {
       chunk[i] = static_cast<uint8_t>(payload[sent + i]) ^ kMask[(sent + i) & 3];
     }
-    if (g_tls.write(chunk, n) != n) return false;
+    if (!writeAll(chunk, n)) return false;
     sent += n;
     // Yield between chunks: this is the only place the loop task gets a chance
     // to run while a large push is in flight.
