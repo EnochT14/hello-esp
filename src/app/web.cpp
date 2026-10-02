@@ -246,15 +246,35 @@ size_t walkEntries(bool approvedOnly, F cb) {
   return count;
 }
 
+// Appends to a bounded buffer and returns the new offset, clamped to cap.
+//
+// snprintf() returns the length it WOULD have written, so the old
+// `o += snprintf(buf + o, sizeof(buf) - o, ...)` let o run past the end of the
+// buffer. The next call then evaluated `sizeof(buf) - o` as a size_t, which
+// wrapped to an enormous value, and snprintf wrote past the end of a static
+// buffer. That corrupted memory hard enough to wedge the AsyncWebServer task:
+// after it, every LAN request hung and the device stopped answering on the
+// network. Clamping here means a full buffer simply stops accepting output.
+size_t appendBounded(char* buf, size_t cap, size_t o, const char* fmt, ...) {
+  if (o >= cap) return cap;
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = vsnprintf(buf + o, cap - o, fmt, ap);
+  va_end(ap);
+  if (n < 0) return o;
+  const size_t next = o + static_cast<size_t>(n);
+  return next > cap ? cap : next;
+}
+
 void emitEntry(const Row& r, char* out, size_t cap, size_t* o, bool withReplyTo) {
   char e[32] = "", m[256] = "", n[48] = "", t[40] = "";
   util::jsonEscape(r.message, m, sizeof(m));
   util::jsonEscape(r.name, n, sizeof(n));
   util::jsonEscape(r.time, t, sizeof(t));
-  *o += snprintf(out + *o, cap - *o,
+  *o = appendBounded(out, cap, *o,
                  "{\"time\":\"%s\",\"country\":\"%s\",\"name\":\"%s\",\"message\":\"%s\",\"id\":\"%s\"",
                  t, r.country, n, m, r.id);
-  if (withReplyTo) *o += snprintf(out + *o, cap - *o, ",\"reply_to\":\"%s\"", r.replyTo);
+  if (withReplyTo) *o = appendBounded(out, cap, *o, ",\"reply_to\":\"%s\"", r.replyTo);
 }
 
 // --- /stats ---------------------------------------------------------------
@@ -357,7 +377,7 @@ size_t buildStatsJson(char* out, size_t cap) {
 
 static size_t buildCountriesJson(char* out, size_t cap) {
   size_t o = 0;
-  o += snprintf(out + o, cap - o, "{");
+  o = appendBounded(out, cap, o, "{");
   std::string raw;
   if (fsx::readAll("/countries.csv", raw, 4096)) {
     const char* p = raw.c_str();
@@ -372,7 +392,7 @@ static size_t buildCountriesJson(char* out, size_t cap) {
         char* cr = strchr(line, '\r');
         if (cr) *cr = '\0';
         if (line[2] == ',') {
-          o += snprintf(out + o, cap - o, "%s\"%c%c\":%s",
+          o = appendBounded(out, cap, o, "%s\"%c%c\":%s",
                         first ? "" : ",", line[0], line[1], line + 3);
           first = false;
         }
@@ -381,7 +401,7 @@ static size_t buildCountriesJson(char* out, size_t cap) {
       p = eol + 1;
     }
   }
-  o += snprintf(out + o, cap - o, "}");
+  o = appendBounded(out, cap, o, "}");
   return o;
 }
 
@@ -391,7 +411,7 @@ static size_t buildHistoryIndexJson(char* out, size_t cap) {
   struct tm t = {};
   const int thisYear = getLocalTime(&t, 0) ? (t.tm_year + 1900) : 2026;
   size_t o = 0;
-  o += snprintf(out + o, cap - o, "{\"weekly\":[");
+  o = appendBounded(out, cap, o, "{\"weekly\":[");
   auto emit = [&](const char* kind, bool* first) {
     for (int y = thisYear - 4; y <= thisYear; ++y) {
       char dir[64];
@@ -407,27 +427,27 @@ static size_t buildHistoryIndexJson(char* out, size_t cap) {
         }
         snprintf(file, sizeof(file), "%s/%s.json", dir, label);
         if (!fsx::exists(file)) continue;
-        o += snprintf(out + o, cap - o, "%s\"%s\"", *first ? "" : ",", label);
+        o = appendBounded(out, cap, o, "%s\"%s\"", *first ? "" : ",", label);
         *first = false;
       }
     }
   };
   bool first = true;
   emit("weekly", &first);
-  o += snprintf(out + o, cap - o, "],\"monthly\":[");
+  o = appendBounded(out, cap, o, "],\"monthly\":[");
   first = true;
   emit("monthly", &first);
-  o += snprintf(out + o, cap - o, "],\"yearly\":[");
+  o = appendBounded(out, cap, o, "],\"yearly\":[");
   first = true;
   for (int y = thisYear - 4; y <= thisYear; ++y) {
     char file[64], label[8];
     snprintf(file, sizeof(file), "/stats/yearly/%d.json", y);
     if (!fsx::exists(file)) continue;
     snprintf(label, sizeof(label), "%d", y);
-    o += snprintf(out + o, cap - o, "%s\"%s\"", first ? "" : ",", label);
+    o = appendBounded(out, cap, o, "%s\"%s\"", first ? "" : ",", label);
     first = false;
   }
-  o += snprintf(out + o, cap - o, "],\"current\":{\"week\":\"%s\",\"month\":\"%s\",\"year\":\"%s\"}}",
+  o = appendBounded(out, cap, o, "],\"current\":{\"week\":\"%s\",\"month\":\"%s\",\"year\":\"%s\"}}",
                 state::weekLabel(), state::monthLabel(), state::yearLabel());
   return o;
 }
@@ -473,7 +493,7 @@ static size_t buildGuestbookEntriesJson(char* out, size_t cap, int pageNo,
   if (matchingOut) *matchingOut = matching;
 
   size_t o = 0;
-  o += snprintf(out + o, cap - o, "{\"entries\":[");
+  o = appendBounded(out, cap, o, "{\"entries\":[");
   int emitted = 0;
   const int offset = (pageNo - 1) * static_cast<int>(kPageSize);
   walkEntries(true, [&](const Row* row) {
@@ -491,32 +511,32 @@ static size_t buildGuestbookEntriesJson(char* out, size_t cap, int pageNo,
       return true;
     });
 
-    if (emitted++) o += snprintf(out + o, cap - o, ",");
+    if (emitted++) o = appendBounded(out, cap, o, ",");
     emitEntry(*row, out, cap, &o, false);
-    o += snprintf(out + o, cap - o, ",\"reply_count\":%d", replyCount);
+    o = appendBounded(out, cap, o, ",\"reply_count\":%d", replyCount);
     if (replyCount >= 1 && replyCount <= 2) {
-      o += snprintf(out + o, cap - o, ",\"preview_replies\":[");
+      o = appendBounded(out, cap, o, ",\"preview_replies\":[");
       int pre = 0;
       walkEntries(true, [&](const Row* other) {
         if (pre >= 2) return false;
         if (strcmp(other->replyTo, row->id) != 0) return true;
-        if (pre++) o += snprintf(out + o, cap - o, ",");
+        if (pre++) o = appendBounded(out, cap, o, ",");
         emitEntry(*other, out, cap, &o, true);
         return true;
       });
-      o += snprintf(out + o, cap - o, "]");
+      o = appendBounded(out, cap, o, "]");
     }
-    o += snprintf(out + o, cap - o, "}");
+    o = appendBounded(out, cap, o, "}");
     return true;
   });
 
   const bool hasMore = (offset + emitted) < totalApproved;
-  o += snprintf(out + o, cap - o, "],\"hasMore\":%s,\"total\":%d,\"countries\":%d",
+  o = appendBounded(out, cap, o, "],\"hasMore\":%s,\"total\":%d,\"countries\":%d",
                 hasMore ? "true" : "false", totalApproved, countryCount);
   if (needle.length()) {
-    o += snprintf(out + o, cap - o, ",\"matching\":%d}", matching);
+    o = appendBounded(out, cap, o, ",\"matching\":%d}", matching);
   } else {
-    o += snprintf(out + o, cap - o, "}");
+    o = appendBounded(out, cap, o, "}");
   }
   return o;
 }
@@ -525,10 +545,10 @@ static void xmlEscape(const char* in, char* out, size_t cap) {
   size_t o = 0;
   for (const char* p = in; *p && o + 7 < cap; ++p) {
     switch (*p) {
-      case '&': o += snprintf(out + o, cap - o, "&amp;"); break;
-      case '<': o += snprintf(out + o, cap - o, "&lt;"); break;
-      case '>': o += snprintf(out + o, cap - o, "&gt;"); break;
-      case '"': o += snprintf(out + o, cap - o, "&quot;"); break;
+      case '&': o = appendBounded(out, cap, o, "&amp;"); break;
+      case '<': o = appendBounded(out, cap, o, "&lt;"); break;
+      case '>': o = appendBounded(out, cap, o, "&gt;"); break;
+      case '"': o = appendBounded(out, cap, o, "&quot;"); break;
       default: out[o++] = *p;
     }
   }
@@ -537,7 +557,7 @@ static void xmlEscape(const char* in, char* out, size_t cap) {
 
 static size_t buildGuestbookRss(char* out, size_t cap) {
   size_t o = 0;
-  o += snprintf(out + o, cap - o,
+  o = appendBounded(out, cap, o,
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\">\n<channel>\n"
       "<title>HelloESP guestbook</title>\n<link>/guestbook</link>\n<description>Recent messages</description>\n");
   int n = 0;
@@ -554,14 +574,14 @@ static size_t buildGuestbookRss(char* out, size_t cap) {
     xmlEscape(title, body, sizeof(body));
     char msg[256], safe[512];
     xmlEscape(row->message, msg, sizeof(msg));
-    o += snprintf(out + o, cap - o,
+    o = appendBounded(out, cap, o,
         "<item><title>%s</title><link>/guestbook#%s</link>"
         "<guid>gb-%s</guid><pubDate>%s</pubDate><description>%s</description></item>\n",
         body, row->id, row->id, row->time, msg);
     (void)safe;
     return true;
   });
-  o += snprintf(out + o, cap - o, "</channel>\n</rss>\n");
+  o = appendBounded(out, cap, o, "</channel>\n</rss>\n");
   return o;
 }
 
@@ -821,7 +841,7 @@ void begin() {
   g_server.on("/countries", HTTP_GET, [](AsyncWebServerRequest* r) {
     
     size_t o = 0;
-    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "{");
+    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "{");
     std::string raw;
     if (fsx::readAll("/countries.csv", raw, 4096)) {
       const char* p = raw.c_str();
@@ -836,7 +856,7 @@ void begin() {
           char* cr = strchr(line, '\r');
           if (cr) *cr = '\0';
           if (line[2] == ',') {
-            o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "%s\"%c%c\":%s",
+            o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "%s\"%c%c\":%s",
                           first ? "" : ",", line[0], line[1], line + 3);
             first = false;
           }
@@ -857,7 +877,7 @@ void begin() {
   g_server.on("/history.json", HTTP_GET, [](AsyncWebServerRequest* r) {
     
     size_t o = 0;
-    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "{\"weekly\":[");
+    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "{\"weekly\":[");
     // Archives live at /stats/{weekly,monthly}/<year>/<label>.json; the API
     // flattens the year directory away.
     auto emitList = [&](const char* kind, bool* first) {
@@ -879,7 +899,7 @@ void begin() {
           else snprintf(label, sizeof(label), "%d-%02d", y, w);
           snprintf(file, sizeof(file), "%s/%s.json", dir, label);
           if (!fsx::exists(file)) continue;
-          o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "%s\"%s\"", *first ? "" : ",", label);
+          o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "%s\"%s\"", *first ? "" : ",", label);
           *first = false;
         }
       }
@@ -887,17 +907,17 @@ void begin() {
     };
     bool first = true;
     emitList("weekly", &first);
-    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "],\"monthly\":[");
+    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "],\"monthly\":[");
     first = true;
     emitList("monthly", &first);
-    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "],\"yearly\":[");
+    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "],\"yearly\":[");
     first = true;
     for (int y = 2020; y <= 2100; ++y) {
       char file[64], label[8];
       snprintf(file, sizeof(file), "/stats/yearly/%d.json", y);
       if (!fsx::exists(file)) continue;
       snprintf(label, sizeof(label), "%d", y);
-      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "%s\"%s\"", first ? "" : ",", label);
+      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "%s\"%s\"", first ? "" : ",", label);
       first = false;
     }
     snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
@@ -999,7 +1019,7 @@ void begin() {
     });
 
     size_t o = 0;
-    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "{\"entries\":[");
+    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "{\"entries\":[");
     int emitted = 0;
     walkEntries(true, [&](const Row* row) {
       if (needle.length() && !util::containsCI(row->name, needle.c_str()) &&
@@ -1021,34 +1041,34 @@ void begin() {
         return true;
       });
 
-      if (emitted++) o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",");
+      if (emitted++) o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",");
       emitEntry(*row, g_lanBuf, sizeof(g_lanBuf), &o, false);
-      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",\"reply_count\":%d", replyCount);
+      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",\"reply_count\":%d", replyCount);
       if (replyCount >= 1 && replyCount <= 2) {
-        o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",\"preview_replies\":[");
+        o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",\"preview_replies\":[");
         int pre = 0;
         walkEntries(true, [&](const Row* other) {
           if (pre >= 2) return false;
           if (strcmp(other->replyTo, row->id) != 0) return true;
-          if (pre++) o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",");
+          if (pre++) o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",");
           emitEntry(*other, g_lanBuf, sizeof(g_lanBuf), &o, true);
           return true;
         });
-        o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "]");
+        o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "]");
       }
-      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "}");
+      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "}");
       return true;
     });
 
     const int offset = (pageNo - 1) * static_cast<int>(kPageSize);
     const bool hasMore = (offset + emitted) < totalApproved;
-    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
+    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o,
                   "],\"hasMore\":%s,\"total\":%d,\"countries\":%d",
                   hasMore ? "true" : "false", totalApproved, countryCount);
     if (q.length()) {
-      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",\"matching\":%d}", matching);
+      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",\"matching\":%d}", matching);
     } else {
-      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "}");
+      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "}");
     }
     sendJson(r, g_lanBuf, q.length() ? nullptr : "public, max-age=30");
   });
@@ -1191,19 +1211,19 @@ void begin() {
     }
     
     size_t o = 0;
-    o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, "{\"entries\":[");
+    o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, "{\"entries\":[");
     int shown = 0;
     int idx = 0;
     walkEntries(false, [&](const Row* row) {
       const int myIdx = idx++;
       if (row->status != '0') return true;
       if (shown >= static_cast<int>(kPageSize)) return false;
-      if (shown++) o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o, ",");
+      if (shown++) o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o, ",");
       char m[256] = "", n[48] = "", t[40] = "";
       util::jsonEscape(row->message, m, sizeof(m));
       util::jsonEscape(row->name, n, sizeof(n));
       util::jsonEscape(row->time, t, sizeof(t));
-      o += snprintf(g_lanBuf + o, sizeof(g_lanBuf) - o,
+      o = appendBounded(g_lanBuf, sizeof(g_lanBuf), o,
                     "{\"idx\":%d,\"time\":\"%s\",\"country\":\"%s\",\"name\":\"%s\","
                     "\"message\":\"%s\",\"id\":\"%s\",\"reply_to\":\"%s\",\"approved\":0}",
                     myIdx, t, row->country, n, m, row->id, row->replyTo);
