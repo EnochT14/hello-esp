@@ -18,6 +18,13 @@ preview_urls = false
 # (optional) dead-man's-switch threshold; default 6 hours, accepts fractional hours
 #   wrangler secret put DEADMAN_HOURS  # e.g. "12" or "0.5" for testing
 #
+# (optional) silence backup emails only (failure + overdue) while keeping
+# deadman/guestbook alerts. Useful when the device is intentionally offline
+# for a while. Maintenance mode (up to 30 days via admin panel) also pauses
+# deadman + backup alerts; this flag is the worker-side kill-switch that
+# works even when the device is offline and can't set maintenance itself.
+#   wrangler secret put BACKUP_ALERTS  # "off" to silence, delete to re-enable
+#
 # (optional) R2 backup bucket. If not bound, Worker falls back to emailing the bundle as an
 # attachment. Create the bucket once before deploying:
 #   wrangler r2 bucket create helloesp-backup

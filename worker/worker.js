@@ -174,6 +174,8 @@ export class EspRelay {
       const lbd = await state.storage.get('lastBackupDate');
       const lact = await state.storage.get('lastActivity');
       const fseen = await state.storage.get('firstSeenAt');
+      const lbMissed = await state.storage.get('lastBackupMissedEmailAt');
+      const lbFail = await state.storage.get('lastBackupFailureEmailAt');
       if (typeof u === 'number') this.maintenanceUntil = u;
       if (typeof m === 'string') this.maintenanceMessage = m;
       if (w && typeof w === 'object') this.lastWeather = w;
@@ -196,6 +198,10 @@ export class EspRelay {
         this.firstSeenAt = Date.now();
         await state.storage.put('firstSeenAt', this.firstSeenAt);
       }
+      // Persisted throttle markers so a DO isolate eviction doesn't reset
+      // the 1/hr + 1/day email caps and re-spam the inbox after restart.
+      if (typeof lbMissed === 'number') this.lastBackupMissedEmailAt = lbMissed;
+      if (typeof lbFail === 'number') this.lastBackupFailureEmailAt = lbFail;
     });
     this._ensureAlarm(30000);
   }
@@ -260,6 +266,9 @@ export class EspRelay {
     const env = this.env;
     if (!env.SMTP2GO_KEY || !env.NOTIFY_EMAIL) return;
     const now = Date.now();
+    // Planned downtime: maintenance window suppresses the deadman alert so an
+    // intentionally-offline device doesn't spam the inbox.
+    if (now < this.maintenanceUntil) return;
     // DEADMAN_HOURS env var overrides default; typical home has near-zero ISP outages >6h
     const hoursCfg = parseFloat(env.DEADMAN_HOURS);
     const DEAD_HOURS = (hoursCfg > 0 && hoursCfg < 720) ? hoursCfg : 6;
@@ -736,7 +745,10 @@ export class EspRelay {
   }
 
   async setMaintenance(minutes, message) {
-    const m = Math.min(120, Math.max(0, Number(minutes) || 0));
+    // Cap at 30 days so an intentionally-offline device (e.g. travelling,
+    // hardware down for weeks) can be silenced with one action instead of
+    // re-arming a 2h window. 0 still cancels.
+    const m = Math.min(43200, Math.max(0, Number(minutes) || 0));
     if (m === 0) {
       this.maintenanceUntil = 0;
       this.maintenanceMessage = '';
@@ -1106,12 +1118,20 @@ export class EspRelay {
     }
   }
 
+  _backupAlertsOff() {
+    const v = String(this.env.BACKUP_ALERTS ?? '').trim().toLowerCase();
+    return v === 'off' || v === '0' || v === 'false' || v === 'no';
+  }
+
   async _sendBackupFailureAlert(date, reason) {
     const env = this.env;
     if (!env.SMTP2GO_KEY || !env.NOTIFY_EMAIL) return;
+    if (this._backupAlertsOff()) return;
     const now = Date.now();
+    if (now < this.maintenanceUntil) return;
     if (now - this.lastBackupFailureEmailAt < 3600000) return; // one per hour at most
     this.lastBackupFailureEmailAt = now;
+    await this.state.storage.put('lastBackupFailureEmailAt', now).catch(() => {});
     try {
       await this._sendEmail({
         subject: `HelloESP backup FAILED - ${date}`,
@@ -1218,18 +1238,40 @@ export class EspRelay {
     sendResult(true, 'put/get/delete ok');
   }
 
+  async _claimMissedBackupAlert(referenceTime, now) {
+    return this.state.storage.transaction(async txn => {
+      const previous = await txn.get('missedBackupAlertState');
+      const current = previous && previous.referenceTime === referenceTime ? previous : null;
+      const legacyLastAt = previous ? 0 : (await txn.get('lastBackupMissedEmailAt') || 0);
+      const nextAt = current ? current.nextAt : legacyLastAt + 86400000;
+      if (now < nextAt) return false;
+      const count = current ? current.count : (legacyLastAt ? 1 : 0);
+      const delay = Math.min(30, 2 ** Math.min(count, 5)) * 86400000;
+      await txn.put({
+        missedBackupAlertState: { referenceTime, count: Math.min(count + 1, 6), nextAt: now + delay },
+        lastBackupMissedEmailAt: now
+      });
+      return true;
+    });
+  }
+
   async _maybeSendMissedBackupAlert() {
     const env = this.env;
     if (!env.SMTP2GO_KEY || !env.NOTIFY_EMAIL) return;
+    if (this._backupAlertsOff()) return;
+    const now = Date.now();
+    if (now < this.maintenanceUntil) return;
+    if (!this.espSocket || this.espSocket.readyState !== 1 || !this.hmacAuthenticated) return;
+    if (this.lastActivity <= 0 || now - this.lastActivity > 75000) return;
+    if (this.deadmanAlertSent) return;
     // Use lastBackupAt if any successful backup has happened; otherwise use
     // the DO's first-seen time as the reference. Without this, a fresh
     // deploy that never gets a successful backup would never alert.
     const referenceTime = this.lastBackupAt || this.firstSeenAt;
     if (!referenceTime) return;
-    const now = Date.now();
     const ageMs = now - referenceTime;
     if (ageMs < 48 * 3600000) return;                              // fresh
-    if (now - this.lastBackupMissedEmailAt < 24 * 3600000) return; // one per day
+    if (!await this._claimMissedBackupAlert(referenceTime, now)) return;
     this.lastBackupMissedEmailAt = now;
     const ageHours = Math.floor(ageMs / 3600000);
     const neverHadOne = !this.lastBackupAt;
@@ -1384,8 +1426,8 @@ export class EspRelay {
     // dead-man's-switch: email if ESP has been silent for >24h
     this.maybeSendDeadmanAlert().catch(() => {});
 
-    // overdue-backup alert: email if last successful backup is >48h old (once per day)
-    this._maybeSendMissedBackupAlert().catch(() => {});
+    await this._maybeSendMissedBackupAlert().catch(e =>
+      console.error('missed-backup alert failed:', e && e.message));
 
     // dead-client sweep: if ESP isn't pushing events, broadcasts don't prune dead SSE writers.
     // Send a zero-cost SSE comment to every client; prune any that throw.
@@ -2093,6 +2135,54 @@ export class EspRelay {
       });
 
       return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // Remote maintenance control (works even when ESP is offline).
+    // Lets the owner silence dead-man / overdue-backup alerts while the
+    // device is intentionally offline (travel, hardware down, etc.) without
+    // needing the ESP to be up to relay the WS `maintenance` event.
+    // Auth: Bearer WORKER_SECRET (same trust model as /admin/do/*).
+    if (url.pathname === '/admin/maintenance') {
+      const corsM = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+        'Access-Control-Max-Age': '600',
+      };
+      if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: corsM });
+      }
+      const authH = request.headers.get('Authorization') || '';
+      const mm = authH.match(/^Bearer\s+(.+)$/);
+      const provided = mm ? mm[1] : '';
+      if (!provided || !timingSafeEqualStr(provided, this.env.WORKER_SECRET || '')) {
+        return new Response('Unauthorized', { status: 401, headers: corsM });
+      }
+      if (request.method === 'GET') {
+        const remaining = Math.max(0, this.maintenanceUntil - Date.now());
+        return new Response(JSON.stringify({
+          maintenanceUntil: this.maintenanceUntil,
+          maintenanceMessage: this.maintenanceMessage,
+          remainingMs: remaining,
+          active: remaining > 0
+        }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsM } });
+      }
+      if (request.method === 'POST') {
+        let body;
+        try { body = await request.json(); } catch (e) {
+          return new Response('Invalid JSON', { status: 400, headers: corsM });
+        }
+        const minutes = Math.max(0, parseInt(body.minutes, 10) || 0);
+        const message = String(body.message || '').slice(0, 200);
+        await this.setMaintenance(minutes, message);
+        const remaining = Math.max(0, this.maintenanceUntil - Date.now());
+        return new Response(JSON.stringify({
+          ok: true,
+          maintenanceUntil: this.maintenanceUntil,
+          remainingMs: remaining
+        }), { status: 200, headers: { 'Content-Type': 'application/json', ...corsM } });
+      }
+      return new Response('Method not allowed', { status: 405, headers: corsM });
     }
 
     // maintenance window takes precedence over offline, so planned work shows the right page

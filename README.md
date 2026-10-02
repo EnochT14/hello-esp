@@ -256,7 +256,7 @@ Configuring [SMTP2GO](https://smtp2go.com/) once unlocks every alert channel the
 
 - Guestbook moderation notifications (throttled 1/5min)
 - Dead-man's-switch: device silent for longer than `DEADMAN_HOURS` (default 6) + recovery email when it comes back
-- Backup failures (throttled 1/hr) and overdue-backup warnings (>48 h since last success, 1/day)
+- Backup failures (throttled 1/hr) and overdue-backup warnings (>48 h since last success, reminders after 1, 2, 4, 8, 16, then 30 days)
 - Manual test email from the admin panel
 
 ```bash
@@ -264,7 +264,10 @@ wrangler secret put SMTP2GO_KEY
 wrangler secret put NOTIFY_EMAIL
 wrangler secret put NOTIFY_FROM    # optional, e.g. "HelloESP <no-reply@yourdomain>"
 wrangler secret put DEADMAN_HOURS  # optional, default 6, accepts fractional hours
+wrangler secret put BACKUP_ALERTS  # optional, "off" to silence backup failure/overdue emails only
 ```
+
+Overdue-backup warnings require an authenticated, open device connection with activity within 75 seconds. Reminder intervals double from 1 day to a 30-day cap. The schedule is persisted before sending, survives Worker restarts, and resets for a new successful backup. Offline devices are covered by the one-time deadman alert instead. Maintenance mode (up to 30 days, 1-day/7-day shortcuts in the admin panel) pauses deadman + backup emails.
 
 The ESP never blocks on outbound HTTPS; all email sending lives on the Worker. If any required secret is unset, the corresponding alerts silently no-op.
 
@@ -283,7 +286,7 @@ The binding is declared in `wrangler.toml`. If the binding isn't present, the Wo
 
 **Storage math.** ~1.4 MB per snapshot × ~23 retained snapshots ≈ 32 MB/year. Well under R2's 10 GB free tier.
 
-**Alerting.** No email on success. A single email fires if a backup fails (throttled 1/hr) or if no successful backup has been committed for >48 h (once per day).
+**Alerting.** No email on success. Failed backup writes are throttled to 1 email/hr. Overdue-backup reminders start after 48 h without success and use persistent exponential backoff (1, 2, 4, 8, 16, then 30 days between attempts), only while the device is online. Offline devices are covered by the deadman alert instead, so an intentionally-offline device doesn't spam the inbox.
 
 ### Restoring from an R2 backup
 
