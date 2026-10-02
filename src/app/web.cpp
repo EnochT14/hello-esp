@@ -17,6 +17,9 @@
 
 namespace web {
 namespace {
+constexpr int kConsoleLines = 200;
+}
+namespace {
 
 AsyncWebServer g_server(80);
 
@@ -131,20 +134,38 @@ void sendText(AsyncWebServerRequest* r, int code, const char* body) {
 // pool clear, which is what stops relayed pushes from failing under load.
 // Static assets ship pre-gzipped; serving the .gz directly keeps the LWIP pbuf
 // pool clear, which is what stops relayed pushes from failing under load.
+const char* mimeFor(const char* path) {
+  const char* dot = strrchr(path, '.');
+  if (!dot) return "application/octet-stream";
+  if (strcmp(dot, ".html") == 0) return "text/html";
+  if (strcmp(dot, ".json") == 0) return "application/json";
+  if (strcmp(dot, ".css") == 0) return "text/css";
+  if (strcmp(dot, ".js") == 0) return "application/javascript";
+  if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
+  if (strcmp(dot, ".png") == 0) return "image/png";
+  if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0) return "image/jpeg";
+  if (strcmp(dot, ".gif") == 0) return "image/gif";
+  if (strcmp(dot, ".webp") == 0) return "image/webp";
+  if (strcmp(dot, ".ico") == 0) return "image/x-icon";
+  if (strcmp(dot, ".csv") == 0) return "text/csv";
+  if (strcmp(dot, ".txt") == 0) return "text/plain";
+  return "application/octet-stream";
+}
+
 void sendAsset(AsyncWebServerRequest* r, const char* base, const char* cacheControl) {
   char gz[160];
   snprintf(gz, sizeof(gz), "%s.gz", base);
   const bool useGz = r->header("Accept-Encoding").indexOf("gzip") >= 0 && fsx::exists(gz);
   const char* path = useGz ? gz : base;
 
-  File probe = fsx::vol().open(path, FILE_READ);
-  if (!probe) {
+  File f = fsx::vol().open(path, FILE_READ);
+  if (!f) {
     sendText(r, 404, "not found");
     return;
   }
-  const size_t len = probe.size();
-  probe.close();
+  const size_t len = f.size();
   if (!len) {
+    f.close();
     sendText(r, 404, "not found");
     return;
   }
@@ -160,18 +181,26 @@ void sendAsset(AsyncWebServerRequest* r, const char* base, const char* cacheCont
   //
   // The cap keeps a pathological asset from exhausting the heap. Gzipped pages
   // are 5-37KB, so this is generous.
-  constexpr size_t kAssetCap = 96 * 1024;
-  if (len > kAssetCap) {
-    sendText(r, 500, "asset too large");
+  // Buffer small assets. Above the threshold, copy the file into the response
+  // would need twice its size in heap - an 80KB photo becomes 160KB against
+  // ~133KB free - so hand the response an owning file source instead, which
+  // streams straight from flash and keeps the File alive for the response.
+  constexpr size_t kBufferCap = 40 * 1024;
+  if (len > kBufferCap) {
+    AsyncWebServerResponse* resp =
+        r->beginResponse(f, String(path), mimeFor(path));
+    if (cacheControl) resp->addHeader("Cache-Control", cacheControl);
+    r->send(resp);
     return;
   }
+
   std::string body;
   if (!fsx::readAll(path, body, len)) {
     sendText(r, 404, "not found");
     return;
   }
   AsyncWebServerResponse* resp = r->beginResponse(
-      200, "text/html", reinterpret_cast<const uint8_t*>(body.data()), body.size());
+      200, mimeFor(path), reinterpret_cast<const uint8_t*>(body.data()), body.size());
   if (useGz) resp->addHeader("Content-Encoding", "gzip");
   if (cacheControl) resp->addHeader("Cache-Control", cacheControl);
   r->send(resp);
@@ -493,6 +522,43 @@ static size_t buildStatsCurrentJson(char* out, size_t cap) {
   return snprintf(out, cap, "{\"week\":%s,\"month\":%s,\"year\":%s}", w, m, y);
 }
 
+// Newest-first tail of the device log, as the console page expects.
+static size_t buildConsoleJson(char* out, size_t cap) {
+  size_t o = 0;
+  o = appendBounded(out, cap, o, "{\"entries\":[");
+
+  File f = fsx::vol().open("/logs/errors.log", FILE_READ);
+  if (f) {
+    std::string raw;
+    if (fsx::readAll("/logs/errors.log", raw, 8 * 1024) && raw.size()) {
+      // Split on newlines and walk backwards so the newest entries land first.
+      std::vector<std::string> lines;
+      size_t start = 0;
+      for (size_t i = 0; i <= raw.size(); ++i) {
+        if (i == raw.size() || raw[i] == '\n') {
+          if (i > start) lines.push_back(raw.substr(start, i - start));
+          start = i + 1;
+        }
+      }
+      int emitted = 0;
+      for (size_t i = lines.size(); i-- > 0 && emitted < kConsoleLines; ) {
+        const std::string& line = lines[i];
+        if (line.empty()) continue;
+        if (emitted++) o = appendBounded(out, cap, o, ",");
+        char msg[256], ts[48];
+        util::jsonEscape(line.c_str(), msg, sizeof(msg));
+        snprintf(ts, sizeof(ts), "%s", msg);
+        o = appendBounded(out, cap, o,
+                          "{\"key\":\"%d\",\"level\":\"error\",\"text\":\"%s\"}",
+                          emitted, ts);
+      }
+    }
+    f.close();
+  }
+  o = appendBounded(out, cap, o, "]}");
+  return o;
+}
+
 // Newest-first page of approved guestbook entries.
 static size_t buildGuestbookEntriesJson(char* out, size_t cap, int pageNo,
                                        const String& needle, int* matchingOut) {
@@ -640,10 +706,33 @@ void handleRelayedRequest(int32_t id, const char* method, const char* path,
   auto sendAsset = [&](const char* file, const char* cc) {
     char gz[160];
     snprintf(gz, sizeof(gz), "%s.gz", file);
-    if (fsx::exists(gz)) relay::sendFile(id, gz, "text/html", "gzip", cc);
-    else if (fsx::exists(file)) relay::sendFile(id, file, "text/html", nullptr, cc);
-    else relay::sendFile(id, "/404.html", "text/html", nullptr, "no-store");
+    if (fsx::exists(gz)) {
+      relay::sendFile(id, gz, "text/html", "gzip", cc);
+    } else if (fsx::exists(file)) {
+      relay::sendFile(id, file, mimeFor(file), nullptr, cc);
+    } else {
+      relay::sendFile(id, "/404.html", "text/html", nullptr, "no-store");
+    }
   };
+
+  // Root-level images the pages reference by absolute path. There is no route
+  // per file, so they are matched by extension here, exactly as on the LAN.
+  const bool isImage = strcmp(path, "/favicon.ico") == 0 ||
+                       strstr(path, ".jpg") != nullptr ||
+                       strstr(path, ".jpeg") != nullptr ||
+                       strstr(path, ".png") != nullptr ||
+                       strstr(path, ".svg") != nullptr ||
+                       strstr(path, ".webp") != nullptr ||
+                       strstr(path, ".gif") != nullptr;
+  if (strcmp(path, "/favicon.ico") == 0) {
+    sendAsset("/favicon.svg", "public, max-age=86400");
+    return;
+  }
+  if (isImage && strchr(path + 1, '/') == nullptr &&
+      strncmp(path, "/fw", 3) != 0) {
+    sendAsset(path, "public, max-age=3600");
+    return;
+  }
 
   // Relayed traffic has already been filtered by the Worker, so it is public
   // traffic by definition and every hit counts.
@@ -711,8 +800,8 @@ void handleRelayedRequest(int32_t id, const char* method, const char* path,
   }
 
   if (strcmp(path, "/console.json") == 0) {
-    // The console log is now Worker-side; the device has no per-request log.
-    sendJsonBuf("{\"entries\":[]}", "no-store");
+    buildConsoleJson(g_relayBuf, sizeof(g_relayBuf));
+    sendJsonBuf(g_relayBuf, "no-store");
     return;
   }
 
@@ -900,7 +989,8 @@ void begin() {
   });
 
   g_server.on("/console.json", HTTP_GET, [](AsyncWebServerRequest* r) {
-    sendJson(r, "{\"entries\":[]}", "no-store");
+    buildConsoleJson(g_lanBuf, sizeof(g_lanBuf));
+    sendJson(r, g_lanBuf, "no-store");
   });
 
   // --- history ---
@@ -1327,9 +1417,31 @@ void begin() {
     sendText(r, 200, "sensor retirement cleared");
   });
 
-  g_server.onNotFound([](AsyncWebServerRequest* r) {
+  // Static assets that live at the filesystem root and are referenced directly by
+// the pages: photos, favicons, the Open Graph banner. There is no route per
+// file, so they are matched by extension here.
+g_server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest* r) {
+    sendAsset(r, "/favicon.svg", "public, max-age=86400");
+  });
+
+g_server.onNotFound([](AsyncWebServerRequest* r) {
     // Genuinely unknown paths only. This must not hijack /stats/*: doing so
     // shadowed /stats/current and served the dashboard blob in its place.
+    if (r->method() == HTTP_GET) {
+      const String url = r->url();
+      // Root-level images the pages reference by absolute path. Restricted to a
+      // known extension set and to a single path segment so this cannot be used
+      // to read arbitrary files such as /config.txt.
+      const bool isImage = url.endsWith(".jpg") || url.endsWith(".jpeg") ||
+                           url.endsWith(".png") || url.endsWith(".svg") ||
+                           url.endsWith(".webp") || url.endsWith(".gif") ||
+                           url.endsWith(".ico");
+      if (isImage && url.indexOf('/') == 0 && url.lastIndexOf('/') == 0 &&
+          !url.startsWith("/fw")) {
+        sendAsset(r, url.c_str(), "public, max-age=3600");
+        return;
+      }
+    }
     sendAsset(r, "/404.html", "no-store");
   });
 

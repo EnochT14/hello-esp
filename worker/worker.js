@@ -1837,14 +1837,17 @@ export class EspRelay {
     }
 
     // The fleet is processed and cached here, so serve it locally rather than
-    // relaying to the chip. Falls back to the device when the cache is cold.
+    // relaying to the chip. An empty-but-valid fleet is still an answer: falling
+    // through to the relay would hand this response to a later request instead.
     if (url.pathname === '/adsb.json') {
-      if (this.lastAdsb && (Date.now() - this.lastAdsbAt) < 60000) {
-        return new Response(this.lastAdsb, {
-          status: 200,
-          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
-        });
-      }
+      const body = (this.lastAdsb && (Date.now() - this.lastAdsbAt) < 60000)
+        ? this.lastAdsb
+        : JSON.stringify({ now: Math.round(Date.now() / 1000), updated: Date.now(),
+                           count: 0, aircraft: [] });
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+      });
     }
 
     if (url.pathname === '/status-wide.svg') {

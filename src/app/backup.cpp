@@ -17,6 +17,8 @@ constexpr uint16_t kFileGapMs = 25;
 // Counts frames the socket refused, reported once at the end of a run so a
 // failing backup says why instead of just reporting a byte total.
 unsigned g_writeFailures = 0;
+unsigned walkFiles = 0;
+unsigned long walkBytes = 0;
 
 bool     g_running = false;
 bool     g_requested = false;
@@ -88,6 +90,8 @@ size_t totalSize(const char* cutoff) {
     if (excludedPath(abs, base)) return true;
     if (!logInWindow(abs, base)) return true;
     total += size;
+    walkFiles++;
+    walkBytes += size;
     return true;
   });
   return total;
@@ -158,6 +162,7 @@ void runOnce() {
   const size_t total = totalSize(date);
   relay::pushBackupStart(g_seq, generatedAt, firmware, uptime, total);
 
+  unsigned sentFiles = 0;
   fsx::walk([&](const char* abs, const char* base, size_t size) {
     if (excludedPath(abs, base)) return true;
     if (!logInWindow(abs, base)) return true;
@@ -184,6 +189,13 @@ void runOnce() {
   Serial.printf("[backup] %s (%u bytes, %u write failures)\n",
                 g_lastOk ? "committed" : "incomplete", (unsigned)total,
                 (unsigned)g_writeFailures);
+  // The walk total and the manifest must agree. If they ever diverge the
+  // snapshot is silently short, so say so rather than reporting success.
+  if (walkFiles && walkFiles != (unsigned)total) {
+    setError("walk/file count mismatch");
+  }
+  walkFiles = 0;
+  walkBytes = 0;
   g_writeFailures = 0;
 }
 

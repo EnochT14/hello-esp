@@ -1,7 +1,7 @@
 // Build-wide constants.
 #pragma once
 
-#define FIRMWARE_VERSION_STR "2.1"
+#define FIRMWARE_VERSION_STR "2.7"
 
 // Pins: generic ESP32 WROOM-32 dev board (DOIT ESP32 DEVKIT V1, 4MB flash).
 // Neither I2C pin is a boot-strapping pin, so a sensor holding the bus low at
