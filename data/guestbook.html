@@ -263,22 +263,6 @@
         .entry-copy.copied .entry-link-label::before { content: 'Copied!'; }
         .entry-share .entry-link-label::before { content: 'Share'; }
         .entry-reply .entry-link-label::before { content: 'Reply'; }
-        .entry-translate .entry-link-label::before { content: 'Translate'; }
-        .entry-translate.translating .entry-link-label::before { content: 'Translating...'; }
-        .entry-message.entry-message-translated { font-style: italic; }
-        .entry-translate-toggle {
-            display: block;
-            margin-top: 4px;
-            font-size: 11px;
-            color: var(--mid);
-            background: none;
-            border: none;
-            padding: 0;
-            cursor: pointer;
-            text-decoration: underline;
-            font-family: inherit;
-        }
-        .entry-translate-toggle:hover { color: var(--ink); }
         @media (max-width: 480px) {
             .entry-link .entry-link-label { display: none; }
             .entry-copy.copied .entry-link-label {
@@ -1017,17 +1001,9 @@
 
     // Visitor's UI language, 2-letter ISO-639 (or 'en' fallback for the
     // exceedingly rare case where navigator.language is unset). Used by the
-    // translate-button gating logic below and sent to the Worker as target_lang.
     var userLocale = (navigator.language || 'en').split('-')[0].toLowerCase();
-    // Translate endpoint lives on the Worker, not the ESP. When this page
-    // is loaded via LAN IP, relative `/guestbook/translate` goes to the ESP
-    // which has no handler. Route cross-origin to the Worker instead.
-    var translateUrl = /helloesp\.com$/i.test(location.hostname)
-        ? '/guestbook/translate'
-        : 'https://esp.ecobbina.work/guestbook/translate';
 
     // Classify text by writing system. We use this for a cheap heuristic:
-    // only show a Translate button when the message's script differs from the
     // visitor's locale script. Same-script pairs (English-vs-Spanish, all
     // Latin) get no button; that false-negative is acceptable for v1 and
     // avoids shipping a 40KB language-detect library or spending a neuron
@@ -1081,7 +1057,6 @@
     var userScript = scriptForLocale(userLocale);
 
     // Character-level language guess for Latin-script text. Used both to
-    // decide whether to show the translate button for same-script messages
     // (Polish on English user etc.) and to pick a sensible source_lang for
     // m2m100. Not a proper detector, just presence checks for diacritics
     // that strongly imply a specific European language.
@@ -1106,10 +1081,7 @@
     // Returns true if the text has strong English markers: -ing/-ed/-ly
     // suffixes or common content/function words. Used as a gate before
     // the last-resort no-stopwords heuristic so casual English without
-    // articles ("Keep going strong little guy") doesn't trigger translate.
-    // Conservative: false positives here mean missing a translate offer
     // for diacritic-less foreign messages, which is acceptable (browser
-    // translate covers it). False negatives here mean offering translate
     // on English, which is more visibly wrong.
     function looksLikeEnglish(text) {
         if (!text) return false;
@@ -1136,37 +1108,8 @@
     function hasNoEnglishStopwords(text) {
         var re = /\b(the|a|an|is|are|was|were|be|been|being|of|to|in|on|at|for|with|by|and|or|but|not|no|this|that|these|those|i|you|he|she|it|we|they|my|your|his|her|its|our|their|me|him|us|them|do|does|did|have|has|had|can|could|will|would|should|may|might|so|if|when|where|why|how|what|who|which|all|some|any|each|every|few|many|more|most|much|other|same|than|then|too|very|just|now|out|up|down|over|under|here|there|hello|hi|hey|thanks|thx|cool|nice|love|like|from)\b/i;
         return !re.test(text);
-    }
-    function shouldOfferTranslate(message) {
-        if (detectScript(message) !== userScript) return true;
-        // Same-script fallback: if we can guess a specific Latin language
-        // from diacritics or word patterns (Polish ł, German ß, French ç,
-        // Italian "amico/piccolo/che" etc.) and it differs from the user's
-        // locale, offer the button.
-        var guess = guessLatinLang(message);
-        if (guess && guess !== userLocale) return true;
-        // Wider fallback for diacritic-rich Latin languages whose marker chars
-        // don't match a specific pattern above (Czech ě/ý, Slovak ľ,
-        // Hungarian ő/ű, Croatian č/š, etc).
-        if (userScript === 'latin' && hasLatinDiacritics(message)) return true;
-        // Last-resort heuristic: Latin-script with no common English stop-
-        // words AND no English suffix/word markers is probably not English.
-        // Gated by length + word count so short or trivial messages don't
-        // trigger spuriously. The looksLikeEnglish check prevents casual
-        // English messages without articles ("Keep going strong little guy")
-        // from being misclassified as foreign.
-        if (userScript === 'latin' && message && message.length >= 15) {
-            var words = (message.match(/\b\w+\b/g) || []).filter(function (w) {
-                return /[a-zA-Z]/.test(w);
-            });
-            if (words.length >= 3 && hasNoEnglishStopwords(message) && !looksLikeEnglish(message)) return true;
-        }
-        return false;
-    }
-
     // Rough map from detected script to likely ISO-639-1 source language.
     // Not perfect (zh vs ja vs ko are all "cjk"; ru covers all Cyrillic) but
-    // m2m100 degrades gracefully when source_lang is wrong: the translation
     // quality dips but still completes. Good enough for a visitor-facing feature.
     var scriptToLang = {
         latin: 'en', cyrillic: 'ru', cjk: 'zh', arabic: 'ar',
@@ -1225,12 +1168,6 @@
         if (level <= 1 && !isRemoved) {
             h += '<button class="entry-link entry-reply" type="button" title="Reply to this message" aria-label="Reply">'
                + '<i class="fa-solid fa-reply"></i>'
-               + '<span class="entry-link-label"></span>'
-               + '</button>';
-        }
-        if (!isRemoved && shouldOfferTranslate(e.message)) {
-            h += '<button class="entry-link entry-translate" type="button" title="Translate this message" aria-label="Translate">'
-               + '<i class="fa-solid fa-language"></i>'
                + '<span class="entry-link-label"></span>'
                + '</button>';
         }
@@ -1618,9 +1555,6 @@
         var copyBtn  = e.target.closest('.entry-copy');
         var shareBtn = e.target.closest('.entry-share');
         var replyBtn = e.target.closest('.entry-reply');
-        var translateBtn = e.target.closest('.entry-translate');
-        var toggleBtn = e.target.closest('.entry-translate-toggle');
-        var btn = copyBtn || shareBtn || replyBtn || translateBtn || toggleBtn;
         if (!btn) return;
         var entry = btn.closest('.entry');
         if (!entry) return;
@@ -1641,13 +1575,6 @@
             return;
         }
 
-        if (translateBtn) {
-            translateEntry(entry, translateBtn);
-            return;
-        }
-
-        if (toggleBtn) {
-            toggleTranslation(entry);
             return;
         }
 
@@ -1664,112 +1591,6 @@
     }
     document.getElementById('entries').addEventListener('click', handleEntryButtonClick);
     document.getElementById('pinned-entry').addEventListener('click', handleEntryButtonClick);
-
-    // Fetch a translation for an entry and swap the message body inline.
-    // The original text is preserved on the element so toggleTranslation can
-    // restore it. Worker caches per (id, target) so repeat clicks on the
-    // same entry from the same locale cost nothing.
-    function translateEntry(entry, btn) {
-        if (btn.classList.contains('translating')) return;
-        var id = entry.getAttribute('data-id');
-        var msgEl = entry.querySelector(':scope > .entry-message');
-        if (!msgEl) return;
-        if (msgEl.getAttribute('data-translated') === '1' ||
-            msgEl.getAttribute('data-translation')) {
-            toggleTranslation(entry);
-            return;
-        }
-        var original = entry.getAttribute('data-message') || msgEl.textContent;
-        btn.classList.add('translating');
-        var xhr = new XMLHttpRequest();
-        xhr.timeout = 15000;
-        xhr.onreadystatechange = function() {
-            if (this.readyState !== 4) return;
-            btn.classList.remove('translating');
-            if (this.status !== 200) {
-                // Surface the Worker's actual error text when available
-                // ("Translation rate limit exceeded...", "Translation
-                // unavailable", etc.) instead of a status-code-only message
-                // the user can't act on. Truncate long bodies defensively.
-                var errText = (this.responseText && this.responseText.length > 0 && this.responseText.length < 200)
-                    ? this.responseText
-                    : 'Translation failed (HTTP ' + this.status + ')';
-                var errEl = document.createElement('div');
-                errEl.className = 'status err';
-                errEl.style.cssText = 'margin-top:4px;font-size:11px;';
-                errEl.setAttribute('role', 'alert');
-                errEl.textContent = errText;
-                msgEl.insertAdjacentElement('afterend', errEl);
-                setTimeout(function() { if (errEl.parentNode) errEl.remove(); }, 4000);
-                return;
-            }
-            try {
-                var data = JSON.parse(this.responseText);
-                if (!data || !data.translated) {
-                    // Show a fallback notice instead of a silent no-op so
-                    // users get feedback when translation isn't available.
-                    var noEl = document.createElement('div');
-                    noEl.className = 'status err';
-                    noEl.style.cssText = 'margin-top:4px;font-size:11px;';
-                    noEl.setAttribute('role', 'alert');
-                    noEl.textContent = 'Translation unavailable';
-                    msgEl.insertAdjacentElement('afterend', noEl);
-                    setTimeout(function() { if (noEl.parentNode) noEl.remove(); }, 4000);
-                    return;
-                }
-                msgEl.setAttribute('data-original', original);
-                msgEl.setAttribute('data-translated', '1');
-                msgEl.textContent = data.translated;
-                msgEl.classList.add('entry-message-translated');
-                var toggle = document.createElement('button');
-                toggle.type = 'button';
-                toggle.className = 'entry-translate-toggle';
-                toggle.textContent = 'Show original';
-                msgEl.insertAdjacentElement('afterend', toggle);
-            } catch (e) {}
-        };
-        xhr.onerror = function() { btn.classList.remove('translating'); };
-        xhr.ontimeout = function() { btn.classList.remove('translating'); };
-        xhr.open('POST', translateUrl, true);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        // Prefer the character-based Latin-lang guess (pl/de/fr/es/pt/it)
-        // when it hits; m2m100 produces much better output when source_lang
-        // is right. Fall back to the script-based map for non-Latin scripts.
-        // For Latin script with no specific guess, send 'auto' so the worker
-        // tries a fallback chain (diacritic-less Czech, Polish, etc. that
-        // can't be confidently identified client-side).
-        var sourceLang = guessLatinLang(original);
-        if (!sourceLang) {
-            var s = detectScript(original);
-            if (s !== 'latin') sourceLang = scriptToLang[s] || 'en';
-            else sourceLang = 'auto';
-        }
-        xhr.send(JSON.stringify({ id: id, text: original, target: userLocale, source: sourceLang }));
-    }
-
-    // Swap between the cached translation and the original without another
-    // Worker hit. Both texts live on data-* attrs of the message element.
-    function toggleTranslation(entry) {
-        var msgEl = entry.querySelector(':scope > .entry-message');
-        if (!msgEl) return;
-        var showingTranslated = msgEl.getAttribute('data-translated') === '1';
-        var toggle = entry.querySelector(':scope > .entry-translate-toggle');
-        if (showingTranslated) {
-            var orig = msgEl.getAttribute('data-original') || '';
-            msgEl.setAttribute('data-translation', msgEl.textContent);
-            msgEl.textContent = orig;
-            msgEl.classList.remove('entry-message-translated');
-            msgEl.setAttribute('data-translated', '0');
-            if (toggle) toggle.textContent = 'Show translation';
-        } else {
-            var translated = msgEl.getAttribute('data-translation') || '';
-            if (!translated) return;
-            msgEl.textContent = translated;
-            msgEl.classList.add('entry-message-translated');
-            msgEl.setAttribute('data-translated', '1');
-            if (toggle) toggle.textContent = 'Show original';
-        }
-    }
 
     // Inline reply form. Built lazily on first Reply click for a given entry.
     function toggleReplyForm(entry) {

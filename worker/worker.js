@@ -127,12 +127,32 @@ const WEATHER_REFRESH_MS = 3600000; // 1 hour
 const WEATHER_STALE_MS   = 7200000; // after 2h with no successful refresh, stop sending outdoor data
 
 // Email backup bundle limits. The Worker chunks the final bundle across however many emails
-// are needed (see BACKUP_PART_SIZE). These ceilings are runaway protection only.
-const BACKUP_MAX_B64       = 80 * 1024 * 1024; // ~60 MB raw bytes once decoded
-const BACKUP_MAX_CHUNKS    = 25000;             // sanity cap on per-session WS frames
+// are needed (see BACKUP_PART_SIZE). Per-file and per-session ceilings live on EspRelay
+// (MAX_FILE_B64 / MAX_TOTAL_BYTES) and apply to the R2 path as well.
 const BACKUP_SESSION_IDLE  = 15 * 60 * 1000;    // drop sessions idle > 15 min
 const BACKUP_PART_SIZE     = 7 * 1024 * 1024;   // raw-byte slice per email (safely < SMTP2GO 10 MB rec.)
 const BACKUP_PART_DELAY_MS = 2000;              // pause between multipart sends
+
+function numOrNull(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (s === 'ground' || s === '') return null;
+    const n = parseFloat(s);
+    return isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function cleanCallsign(v) {
+  if (typeof v !== 'string') return '';
+  return v.replace(/[^A-Za-z0-9]/g, '').trim().slice(0, 8).toUpperCase();
+}
+
+function round4(n) {
+  return Math.round(n * 1e4) / 1e4;
+}
 
 export class EspRelay {
   constructor(state, env) {
@@ -153,8 +173,11 @@ export class EspRelay {
     this.sseClients = new Set();
     this.lastStats = null;  // JSON string of the most recent ESP stats push
     this.lastStatsAt = 0;   // epoch ms when lastStats was set; used to detect staleness for badges
-    this.lastAdsb = null;   // JSON string of the most recent ADS-B fleet push
+    this.lastAdsb = null;   // JSON string of the most recent processed fleet
     this.lastAdsbAt = 0;    // epoch ms when lastAdsb was set
+    // Per-hex trail history. Bounded by ADSB_DROP_MS sweeps; RAM only, since
+    // the receiver re-supplies the whole fleet every cycle.
+    this.adsbTracks = new Map();
     this.lastWeather = null; // cached outdoor weather object
     this.lastAirQuality = null; // cached outdoor air-quality object (PM2.5, US AQI)
     this.deadmanAlertSent = false; // so we don't spam when offline persists past 24h
@@ -799,12 +822,13 @@ export class EspRelay {
       }
       if (msg.event === 'adsb_update') {
         if (msg.data) {
-          // Cache the latest fleet so a fresh SSE viewer gets instant data
-          // (same replay-on-connect pattern as lastStats). RAM only; the
-          // fleet is inherently transient and self-healing from the ESP.
-          this.lastAdsb = JSON.stringify(msg.data);
+          // Filtering, trail tracking and shaping all happen here rather than
+          // on the chip. RAM only: the receiver re-sends the whole fleet each
+          // cycle, so nothing needs to survive a DO restart.
+          const fleet = this._processAdsb(msg.data);
+          this.lastAdsb = JSON.stringify(fleet);
           this.lastAdsbAt = Date.now();
-          this.broadcastEvent('adsb', JSON.stringify(msg.data));
+          this.broadcastEvent('adsb', this.lastAdsb);
         }
         return;
       }
@@ -853,13 +877,50 @@ export class EspRelay {
     }
   }
 
-  // --- Backup session accumulator (device streams chunked events; Worker reassembles, then
-  // storeBackupBundle writes to R2 or falls back to emailBackupBundle if no R2 binding) ---
+  // --- Backup streaming ---
+  //
+  // The device streams a backup as chunked events. Each file is written to R2
+  // as soon as it completes, so a Durable Object only ever holds manifest rows
+  // rather than the whole bundle.
+  //
+  // Buffering the bundle in DO memory was a real bug: if the DO was evicted
+  // part way through a transfer, backup_end found no session, returned early
+  // with no log, and nothing was ever written. The device still saw its socket
+  // open and reported success.
+  //
+  //   state/YYYY-MM-DD/<file>         written incrementally as files complete
+  //   state/YYYY-MM-DD/_manifest.json
+  //   state/latest.json               written last = the commit marker
+  //
+  // A snapshot only counts as committed once latest.json names it, so a
+  // transfer that dies half way leaves the previous snapshot intact and
+  // readable.
+  //
+  // Rotation (GFS): 7 daily + 4 weekly (Sun) + 12 monthly (1st) + yearly
+  // (Jan 1) forever. Prefix + age guards refuse to delete anything recent or
+  // outside the state/YYYY-MM-DD/ namespace.
+
+  // Filenames from the device must match a strict allowlist: alphanumeric,
+  // dot/underscore/dash/slash only. This rejects path traversal (`..`), leading
+  // separators, backslashes (Windows-style traversal), all control chars
+  // including `\r\n` (which would corrupt manifest.json line keys), and
+  // Unicode line separators (U+2028/U+2029). The segment-must-contain-an-alnum
+  // check rejects degenerate names like `.` and `..`.
+  static SAFE_NAME_RE = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+  static SEGMENT_HAS_ALNUM = /(^|\/)[A-Za-z0-9]/;
+
+  // Guard rails so one runaway file cannot exhaust the DO's heap.
+  static MAX_FILE_B64 = 2 * 1024 * 1024;
+  static MAX_TOTAL_BYTES = 8 * 1024 * 1024;
 
   pruneBackupSessions() {
     const cutoff = Date.now() - BACKUP_SESSION_IDLE;
     for (const [seq, s] of this.backupSessions) {
-      if (s.startedAt < cutoff) this.backupSessions.delete(seq);
+      if (s.startedAt < cutoff) {
+        this.backupSessions.delete(seq);
+        console.warn(`backup session ${seq} expired idle after ${s.entries.length} file(s); ` +
+                     `${s.bytes} byte(s) already in R2`);
+      }
     }
   }
 
@@ -869,6 +930,10 @@ export class EspRelay {
 
     if (msg.event === 'backup_start') {
       this.pruneBackupSessions();
+      const prev = this.backupSessions.get(seq);
+      if (prev) {
+        console.warn(`backup session ${seq} restarted; discarding ${prev.entries.length} pending row(s)`);
+      }
       this.backupSessions.set(seq, {
         startedAt: Date.now(),
         meta: {
@@ -876,17 +941,25 @@ export class EspRelay {
           firmware: String(msg.firmware || ''),
           uptime: String(msg.uptime || '')
         },
-        files: [],
+        entries: [],
+        emailFiles: [],       // only populated when the R2 binding is missing
         currentFile: null,
         totalB64: 0,
         chunkCount: 0,
+        bytes: 0,
         aborted: false
       });
       return;
     }
 
     const s = this.backupSessions.get(seq);
-    if (!s || s.aborted) return;
+    if (!s) {
+      // Previously a silent return, which is how a lost bundle looked like a
+      // success. Make it visible.
+      console.warn(`backup event ${msg.event} for unknown session ${seq}`);
+      return;
+    }
+    if (s.aborted) return;
 
     if (msg.event === 'backup_file_start') {
       s.currentFile = {
@@ -894,6 +967,8 @@ export class EspRelay {
         size: Math.max(0, parseInt(msg.size, 10) || 0),
         chunks: []
       };
+      s.totalB64 = 0;
+      s.chunkCount = 0;
       return;
     }
 
@@ -903,28 +978,44 @@ export class EspRelay {
       s.currentFile.chunks.push(data);
       s.totalB64 += data.length;
       s.chunkCount++;
-      if (s.totalB64 > BACKUP_MAX_B64 || s.chunkCount > BACKUP_MAX_CHUNKS) {
+      if (s.totalB64 > EspRelay.MAX_FILE_B64) {
         s.aborted = true;
         this.backupSessions.delete(seq);
-        console.error(`backup session ${seq} aborted: totalB64=${s.totalB64} chunks=${s.chunkCount}`);
+        console.error(`backup session ${seq} aborted: file ${s.currentFile.name} ` +
+                      `exceeded ${EspRelay.MAX_FILE_B64} base64 bytes`);
       }
       return;
     }
 
     if (msg.event === 'backup_file_end') {
       if (!s.currentFile) return;
-      s.files.push({
-        name: s.currentFile.name,
-        size: s.currentFile.size,
-        content_b64: s.currentFile.chunks.join('')
-      });
+      const name = String(msg.name || s.currentFile.name || 'unknown');
+      const declared = s.currentFile.size;
+      const b64 = s.currentFile.chunks.join('');
       s.currentFile = null;
+
+      if (!this.env.BACKUP) {
+        // No bucket: keep the old whole-bundle behaviour so the email
+        // attachment path still works.
+        s.emailFiles.push({ name, size: declared, content_b64: b64 });
+        s.entries.push({ path: name, size: declared });
+        return;
+      }
+
+      const row = await this._storeBackupFile(s, name, declared, b64);
+      s.entries.push(row);
+      if (s.bytes > EspRelay.MAX_TOTAL_BYTES) {
+        s.aborted = true;
+        this.backupSessions.delete(seq);
+        console.error(`backup session ${seq} aborted: bundle exceeded ` +
+                      `${EspRelay.MAX_TOTAL_BYTES} bytes`);
+      }
       return;
     }
 
     if (msg.event === 'backup_file_skipped') {
-      s.files.push({
-        name: String(msg.name || 'unknown'),
+      s.entries.push({
+        path: String(msg.name || 'unknown'),
         size: Math.max(0, parseInt(msg.size, 10) || 0),
         skipped: String(msg.reason || 'unknown')
       });
@@ -932,23 +1023,234 @@ export class EspRelay {
     }
 
     if (msg.event === 'backup_end') {
-      const files = s.files;
-      const meta = s.meta;
       const originalSize = Math.max(0, parseInt(msg.size, 10) || 0);
       this.backupSessions.delete(seq);
-      await this.storeBackupBundle(meta, files, originalSize);
+      if (!this.env.BACKUP) {
+        await this.emailBackupBundle(s.meta, s.emailFiles, originalSize);
+        return;
+      }
+      await this.commitBackupBundle(s, originalSize);
     }
   }
 
-  // --- R2 write path ---
+  // Decode, hash and store one file. Never throws: a failed file becomes a
+  // skipped manifest row so one bad path cannot cost the whole snapshot.
+  async _storeBackupFile(session, name, declaredSize, contentB64) {
+    const env = this.env;
+    const date = this._bucketDate(session.meta.generated_at);
+    const prefix = `state/${date}/`;
+
+    if (typeof name !== 'string' || name.length === 0 || name.length > 256
+        || name.startsWith('/') || name.includes('..')
+        || !EspRelay.SAFE_NAME_RE.test(name)
+        || !EspRelay.SEGMENT_HAS_ALNUM.test(name)) {
+      console.warn(`backup ${date}: rejecting suspicious filename:`, JSON.stringify(name));
+      return { path: String(name).slice(0, 64), size: declaredSize, skipped: 'rejected_name' };
+    }
+
+    try {
+      const bytes = EspRelay._b64ToBytes(contentB64);
+      const hashBuf = await crypto.subtle.digest('SHA-256', bytes);
+      await env.BACKUP.put(prefix + name, bytes);
+      session.bytes += bytes.length;
+      return {
+        path: name,
+        size: bytes.length,
+        sha256: EspRelay._hex(new Uint8Array(hashBuf))
+      };
+    } catch (e) {
+      const reason = (e && e.message) || String(e);
+      console.error(`backup ${date}: failed to store ${name}:`, reason);
+      return { path: name, size: declaredSize, skipped: 'write_failed' };
+    }
+  }
+
+  // Writes the manifest and then the commit marker. This is the only place a
+  // snapshot becomes "real", and it refuses to move the marker when no file
+  // was actually stored.
+  async commitBackupBundle(session, originalSize) {
+    const env = this.env;
+    const date = this._bucketDate(session.meta.generated_at);
+    const prefix = `state/${date}/`;
+    const entries = session.entries;
+    const included = entries.filter(e => !e.skipped);
+    const skipped = entries.filter(e => e.skipped);
+
+    if (!included.length) {
+      const reason = 'no files stored';
+      console.error(`backup ${date}: ${reason}; leaving the commit marker where it is`);
+      await this._sendBackupFailureAlert(date, reason);
+      return false;
+    }
+
+    const manifest = {
+      schema: 'helloesp-backup/2',
+      generated_at: session.meta.generated_at,
+      firmware: session.meta.firmware,
+      uptime: session.meta.uptime,
+      date,
+      original_size: originalSize,
+      files: entries
+    };
+
+    try {
+      await env.BACKUP.put(prefix + '_manifest.json', JSON.stringify(manifest, null, 2), {
+        httpMetadata: { contentType: 'application/json' }
+      });
+      await env.BACKUP.put('state/latest.json', JSON.stringify({
+        date,
+        files: entries.length,
+        included: included.length,
+        skipped: skipped.length,
+        bytes: session.bytes,
+        at: Date.now(),
+        firmware: session.meta.firmware,
+        generated_at: session.meta.generated_at
+      }, null, 2), { httpMetadata: { contentType: 'application/json' } });
+    } catch (e) {
+      const reason = (e && e.message) || String(e);
+      console.error(`backup ${date} commit failed:`, reason);
+      await this._sendBackupFailureAlert(date, reason);
+      return false;
+    }
+
+    this.lastBackupAt = Date.now();
+    this.lastBackupDate = date;
+    await this.state.storage.put('lastBackupAt', this.lastBackupAt);
+    await this.state.storage.put('lastBackupDate', date);
+
+    // Tell the device the bundle was actually stored, not just sent. The device
+    // only records a confirmed backup on this message.
+    if (this.espSocket && this.espSocket.readyState === 1) {
+      try {
+        this.espSocket.send(JSON.stringify({
+          type: 'event',
+          event: 'backup_committed',
+          date,
+          bytes: session.bytes,
+          files: entries.length,
+          included: included.length,
+          skipped: skipped.length,
+          at: this.lastBackupAt
+        }));
+      } catch (e) {
+        console.error('backup_committed push failed:', e && e.message);
+      }
+    }
+
+    // Fire-and-forget rotation. Its failure is logged but doesn't invalidate
+    // the committed backup.
+    this._rotateSnapshots().catch(e => console.error('rotation failed:', e && e.message));
+    return true;
+  }
+
+  // --- ADS-B fleet processing ---
   //
-  // Bundle layout on R2:
-  //   state/YYYY-MM-DD/<file-path-from-device>
-  //   state/YYYY-MM-DD/_manifest.json    (sha256 per file, firmware/uptime meta)
-  //   state/latest.json                   (atomic pointer, written last = commit marker)
+  // The ESP32 only forwards a compact extract from the local receiver: it has no
+  // CPU budget for filtering, trail history, or shaping the JSON the map wants.
+  // Everything downstream of "which aircraft exist right now" lives here, in
+  // the Worker, where it is cheap and shared by every viewer.
   //
-  // Rotation (GFS): 7 daily + 4 weekly (Sun) + 12 monthly (1st) + yearly (Jan 1) forever.
-  // Prefix + age guards refuse to delete anything recent or outside the state/YYYY-MM-DD/ namespace.
+  // Pipeline: normalise -> filter -> track -> cache.
+  //
+  //   normalise  accept both the receiver's raw aircraft.json shape and the
+  //              legacy already-shaped {now, aircraft[]} the chip used to send
+  //   filter     drop anything stale, on the ground, or implausible
+  //   track      remember the last few fixes per ICAO hex so the map can draw
+  //              trails, and expire aircraft that have gone quiet
+  //   cache      the shaped fleet is what /adsb.json serves and what SSE
+  //              broadcasts, so every viewer sees identical numbers
+
+  static ADSB_STALE_MS      = 30000;   // no position feed for 30s -> drop
+  static ADSB_DROP_MS       = 120000;  // silent for 2 min -> forget the trail
+  static ADSB_TRAIL_POINTS  = 12;
+  static ADSB_MAX_TRAIL_AGE_MS = 300000;
+
+  // A single feed that arrives out of order (common: the receiver's own clock
+  // and ours differ) must not erase a newer trail.
+  _processAdsb(raw) {
+    const nowMs = Date.now();
+    const list = Array.isArray(raw) ? raw
+               : (raw && Array.isArray(raw.aircraft)) ? raw.aircraft
+               : [];
+
+    const nowSec = (raw && typeof raw.now === 'number' && raw.now > 1e9)
+      ? Math.round(raw.now)
+      : Math.round(nowMs / 1000);
+
+    const out = [];
+    for (const a of list) {
+      if (!a || typeof a !== 'object') continue;
+
+      const hex = String(a.hex || a.icao || a.id || '').toLowerCase();
+      if (!/^[0-9a-f]{6}$/.test(hex)) continue;
+
+      const lat = numOrNull(a.lat);
+      const lon = numOrNull(a.lon);
+      const seen = numOrNull(a.seen);
+      const seenAgeMs = (seen !== null && seen >= 0) ? seen * 1000
+                        : (seen !== null && seen < 0) ? nowMs - (-seen)   // dump1090 relative
+                        : 0;
+      if (seenAgeMs > EspRelay.ADSB_STALE_MS) continue;
+
+      // Ground vehicles carry no position worth plotting.
+      if (typeof a.ground === 'string' && a.ground.toLowerCase() === 'ground') continue;
+      if (a.alt_baro === 'ground') continue;
+
+      if (lat === null || lon === null) continue;
+      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
+
+      const alt = numOrNull(a.alt_baro !== undefined ? a.alt_baro : a.alt_geom)
+               ?? numOrNull(a.alt);
+      const spd = numOrNull(a.gs) ?? numOrNull(a.speed);
+      const trk = numOrNull(a.track);
+
+      const callsign = cleanCallsign(
+        a.flight !== undefined ? a.flight
+        : a.callsign !== undefined ? a.callsign : '');
+
+      const entry = {
+        hex,
+        lat,
+        lon,
+        seen: Math.round(nowSec - seenAgeMs / 1000)
+      };
+      if (alt !== null) entry.alt_baro = alt;
+      if (spd !== null) entry.gs = spd;
+      if (trk !== null) entry.track = trk;
+      if (callsign) entry.flight = callsign;
+      if (typeof a.category === 'string') entry.category = a.category.toLowerCase();
+      if (typeof a.rssi === 'number') entry.rssi = a.rssi;
+
+      // --- track ---
+      const prev = this.adsbTracks.get(hex);
+      const trail = (prev && prev.trail) ? prev.trail.slice() : [];
+      const last = trail.length ? trail[trail.length - 1] : null;
+      if (!last || (nowMs - last.t) > 1000) {
+        trail.push({ lat, lon, t: nowMs });
+        if (trail.length > EspRelay.ADSB_TRAIL_POINTS) trail.shift();
+      }
+      this.adsbTracks.set(hex, { trail, lastSeenMs: nowMs });
+
+      // Drop stale trails so the map doesn't grow without bound.
+      if (trail.length) {
+        while (trail.length && (nowMs - trail[0].t) > EspRelay.ADSB_MAX_TRAIL_AGE_MS) {
+          trail.shift();
+        }
+      }
+      entry.trail = trail.map(p => [round4(p.lat), round4(p.lon)]);
+      if (!entry.trail.length) delete entry.trail;
+
+      out.push(entry);
+    }
+
+    // Forget aircraft that have gone quiet.
+    for (const [hex, t] of this.adsbTracks) {
+      if (nowMs - t.lastSeenMs > EspRelay.ADSB_DROP_MS) this.adsbTracks.delete(hex);
+    }
+
+    return { now: nowSec, updated: nowMs, count: out.length, aircraft: out };
+  }
 
   static _b64ToBytes(b64) {
     const bin = atob(b64);
@@ -977,111 +1279,6 @@ export class EspRelay {
     if (d.getUTCDate() === 1 && ageDays < 366) return true;                  // monthly (1st, 12mo)
     if (d.getUTCMonth() === 0 && d.getUTCDate() === 1) return true;          // yearly (Jan 1, forever)
     return false;
-  }
-
-  async storeBackupBundle(meta, files, originalSize) {
-    const env = this.env;
-    if (!env.BACKUP) {
-      console.warn('R2 binding BACKUP not configured; falling back to email attachment path');
-      return this.emailBackupBundle(meta, files, originalSize);
-    }
-
-    const date = this._bucketDate(meta.generated_at);
-    const prefix = `state/${date}/`;
-
-    const included = files.filter(f => !f.skipped && f.content_b64 !== undefined);
-    const skipped = files.filter(f => f.skipped);
-
-    const manifest = {
-      schema: 'helloesp-backup/2',
-      generated_at: meta.generated_at,
-      firmware: meta.firmware,
-      uptime: meta.uptime,
-      date,
-      original_size: originalSize,
-      files: []
-    };
-
-    let bytesWritten = 0;
-    try {
-      // Filenames from the device must match a strict allowlist: alphanumeric,
-      // dot/underscore/dash/slash only. This rejects path traversal (`..`),
-      // leading separators, backslashes (Windows-style traversal), all control
-      // chars including `\r\n` (which would corrupt manifest.json line keys),
-      // and Unicode line separators (U+2028/U+2029). Any survivor is safe to
-      // concat into both R2 keys and JSON manifest entries. The segment-must-
-      // contain-an-alphanum check rejects degenerate names like `.` and `..`
-      // which the regex alone would otherwise allow through.
-      const SAFE_NAME_RE = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
-      const SEGMENT_HAS_ALNUM = /(^|\/)[A-Za-z0-9]/;
-      for (const f of included) {
-        if (typeof f.name !== 'string' || f.name.length === 0 || f.name.length > 256
-            || f.name.startsWith('/') || f.name.includes('..')
-            || !SAFE_NAME_RE.test(f.name) || !SEGMENT_HAS_ALNUM.test(f.name)) {
-          console.warn(`backup ${date}: rejecting suspicious filename:`, JSON.stringify(f.name));
-          manifest.files.push({ path: String(f.name).slice(0, 64), size: f.size, skipped: 'rejected_name' });
-          continue;
-        }
-        const bytes = EspRelay._b64ToBytes(f.content_b64);
-        const hashBuf = await crypto.subtle.digest('SHA-256', bytes);
-        const sha256 = EspRelay._hex(new Uint8Array(hashBuf));
-        await env.BACKUP.put(prefix + f.name, bytes);
-        manifest.files.push({ path: f.name, size: bytes.length, sha256 });
-        bytesWritten += bytes.length;
-      }
-      for (const f of skipped) {
-        manifest.files.push({ path: f.name, size: f.size, skipped: f.skipped });
-      }
-      await env.BACKUP.put(prefix + '_manifest.json', JSON.stringify(manifest, null, 2), {
-        httpMetadata: { contentType: 'application/json' }
-      });
-      // Atomic commit: latest.json update is the last write. If any earlier step failed, the
-      // pointer still names whatever snapshot was last fully committed.
-      const latest = {
-        date,
-        files: manifest.files.length,
-        included: included.length,
-        skipped: skipped.length,
-        bytes: bytesWritten,
-        at: Date.now(),
-        firmware: meta.firmware,
-        generated_at: meta.generated_at
-      };
-      await env.BACKUP.put('state/latest.json', JSON.stringify(latest, null, 2), {
-        httpMetadata: { contentType: 'application/json' }
-      });
-    } catch (e) {
-      const reason = (e && e.message) || String(e);
-      console.error(`backup ${date} R2 write failed:`, reason);
-      await this._sendBackupFailureAlert(date, reason);
-      return;
-    }
-
-    this.lastBackupAt = Date.now();
-    this.lastBackupDate = date;
-    await this.state.storage.put('lastBackupAt', this.lastBackupAt);
-    await this.state.storage.put('lastBackupDate', date);
-
-    // Tell the device the bundle was actually stored (not just sent).
-    if (this.espSocket && this.espSocket.readyState === 1) {
-      try {
-        this.espSocket.send(JSON.stringify({
-          type: 'event',
-          event: 'backup_committed',
-          date,
-          bytes: bytesWritten,
-          files: manifest.files.length,
-          included: included.length,
-          skipped: skipped.length,
-          at: this.lastBackupAt
-        }));
-      } catch (e) {
-        console.error('backup_committed push failed:', e && e.message);
-      }
-    }
-
-    // Fire-and-forget rotation. Its failure is logged but doesn't invalidate the committed backup.
-    this._rotateSnapshots().catch(e => console.error('rotation failed:', e && e.message));
   }
 
   async _rotateSnapshots() {
@@ -1581,7 +1778,7 @@ export class EspRelay {
       if (!providedKey || !timingSafeEqualStr(providedKey, this.env.WORKER_SECRET || '')) {
         return new Response('Unauthorized', { status: 401, headers: corsHdrs });
       }
-      // Per-IP rate limit. 30/min for DO ops; mirror /guestbook/translate
+      // Per-IP rate limit. 30/min for DO ops.
       // pattern. Bulk scraping a 1000-key DO would still take ~30 minutes
       // even with a leaked secret, giving time to rotate.
       const dIP = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -1629,215 +1826,15 @@ export class EspRelay {
       return new Response('Not found', { status: 404, headers: corsHdrs });
     }
 
-    // Guestbook inline translation. Powered by Workers AI @cf/meta/m2m100-1.2b
-    // when env.AI is bound (see wrangler.toml [ai] block). Cached per
-    // (id, target) in DO storage so each unique pair costs at most one neuron.
-    // CORS-permissive so the LAN-served guestbook page can hit the Worker
-    // cross-origin (visitors loaded via direct LAN IP).
-    if (url.pathname === '/guestbook/translate') {
-      const corsHdrs = {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Max-Age': '600'
-      };
-      if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: corsHdrs });
+    // The fleet is processed and cached here, so serve it locally rather than
+    // relaying to the chip. Falls back to the device when the cache is cold.
+    if (url.pathname === '/adsb.json') {
+      if (this.lastAdsb && (Date.now() - this.lastAdsbAt) < 60000) {
+        return new Response(this.lastAdsb, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+        });
       }
-      if (request.method !== 'POST') {
-        return new Response('Method not allowed', { status: 405, headers: corsHdrs });
-      }
-      if (!this.env.AI) {
-        return new Response('Translation unavailable (AI binding not configured)',
-          { status: 503, headers: { 'Content-Type': 'text/plain', ...corsHdrs } });
-      }
-
-      // Per-IP rate limit so a single client can't drain the daily neuron
-      // budget. Reuses the existing rateLimits map. Translation is heavier
-      // than a normal relay, so use a tighter cap (10 / minute / IP).
-      const tIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-      const tNow = Date.now();
-      let trl = this.rateLimits.get('xlate:' + tIP);
-      if (!trl || tNow > trl.resetAt) {
-        trl = { count: 0, resetAt: tNow + 60000 };
-        this.rateLimits.set('xlate:' + tIP, trl);
-      }
-      trl.count++;
-      if (trl.count > 10) {
-        return new Response('Translation rate limit exceeded; try again in a minute',
-          { status: 429, headers: { 'Content-Type': 'text/plain', ...corsHdrs } });
-      }
-
-      let body;
-      try { body = await request.json(); } catch (e) {
-        return new Response('Invalid JSON', { status: 400, headers: { 'Content-Type': 'text/plain', ...corsHdrs } });
-      }
-      const id = body && typeof body.id === 'string' ? body.id.slice(0, 32) : '';
-      const text = body && typeof body.text === 'string' ? body.text : '';
-      const target = body && typeof body.target === 'string' ? body.target.toLowerCase().slice(0, 5) : '';
-      const source = body && typeof body.source === 'string' ? body.source.toLowerCase().slice(0, 5) : '';
-      if (!text || text.length > 1000) {
-        return new Response('Text empty or too long (max 1000 chars)',
-          { status: 400, headers: { 'Content-Type': 'text/plain', ...corsHdrs } });
-      }
-      if (!/^[a-z]{2,3}(-[a-z]{2,3})?$/.test(target)) {
-        return new Response('Invalid target language code',
-          { status: 400, headers: { 'Content-Type': 'text/plain', ...corsHdrs } });
-      }
-      // Cache by (id, target, text-hash) when an id is supplied so re-clicks
-      // and other visitors on the same entry don't re-spend neurons.
-      // Including a hash of the text in the key prevents cache poisoning:
-      // an attacker submitting different `text` under a real entry's `id`
-      // can't overwrite what other visitors see, because the lookup hash
-      // won't match what they're translating.
-      let cacheKey = null;
-      if (id) {
-        // 128-bit prefix of SHA-256(text). 64 bits is collision-feasible for
-        // an attacker who can submit translations (~2^32 work to land on
-        // another entry's cache slot under the same id+target); 128 bits
-        // raises that to ~2^64 which is firmly impractical.
-        const hashBuf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-        const hashHex = Array.from(new Uint8Array(hashBuf, 0, 16))
-          .map(b => b.toString(16).padStart(2, '0')).join('');
-        cacheKey = 'translate:' + id + ':' + target + ':' + hashHex;
-      }
-      if (cacheKey) {
-        const cached = await this.state.storage.get(cacheKey);
-        if (typeof cached === 'string' && cached.length > 0) {
-          return new Response(JSON.stringify({ translated: cached, cached: true }),
-            { status: 200, headers: { 'Content-Type': 'application/json', ...corsHdrs } });
-        }
-      }
-
-      const targetLang = target.split('-')[0];
-      // Helper: single m2m100 attempt. Returns the cleaned translated string
-      // or '' on any failure (network error, empty model output, model
-      // echoing the input, etc.). The `<>`-strip is a defensive cleanup
-      // since frontends use textContent and shouldn't render HTML, but a
-      // model that echoes injected markup shouldn't get a chance.
-      const tryTranslate = async (src) => {
-        try {
-          const resp = await this.env.AI.run('@cf/meta/m2m100-1.2b', {
-            text,
-            source_lang: src,
-            target_lang: targetLang,
-          });
-          const out = (resp && typeof resp.translated_text === 'string'
-            ? resp.translated_text : '').replace(/[<>]/g, '').trim();
-          return out;
-        } catch (e) {
-          console.error('translate AI.run failed src=' + src + ':', e && e.message);
-          return '';
-        }
-      };
-      // Helper: identify source language via a small instruct LLM. Used
-      // when the client sends source 'auto' (heuristics couldn't confidently
-      // identify the source). llama-3.2-1b is plenty for "what language is
-      // this" since the answer is a 2-character ISO code; max_tokens kept
-      // tight to avoid hallucinated explanations. Returns null on any
-      // failure (model error, malformed output, ambiguous text). Cost:
-      // single AI call, ~500ms typical. Output validation extracts the
-      // first 2-letter token to tolerate occasional padding or punctuation.
-      const detectLanguage = async (txt) => {
-        try {
-          const resp = await this.env.AI.run('@cf/meta/llama-3.2-1b-instruct', {
-            messages: [
-              { role: 'system', content: 'You identify languages. Respond with only a 2-letter lowercase ISO 639-1 language code (en, cs, pl, de, fr, it, es, ru, zh, ja, ar, etc.), nothing else. No punctuation, no explanation.' },
-              { role: 'user', content: 'What language is this text? ' + txt.slice(0, 400) },
-            ],
-            max_tokens: 8,
-            temperature: 0,
-          });
-          const out = (resp && typeof resp.response === 'string' ? resp.response : '').trim().toLowerCase();
-          const m = out.match(/\b([a-z]{2})\b/);
-          return m ? m[1] : null;
-        } catch (e) {
-          console.error('language detect failed:', e && e.message);
-          return null;
-        }
-      };
-      // Last-resort: have the LLM translate directly. m2m100 expects
-      // properly-accented input; diacritic-less text (e.g., "Plzen zdravi
-      // sveho bratrance" instead of "Plzeň zdraví svého bratrance") often
-      // produces empty/unchanged output. llama-3.2-1b's multilingual
-      // training handles unaccented variants more gracefully. Quality is
-      // lower than purpose-built translation models but reliably non-empty.
-      const translateViaLLM = async (txt, tgtLang) => {
-        const langName = ({
-          en:'English', cs:'Czech', pl:'Polish', de:'German', fr:'French',
-          it:'Italian', es:'Spanish', ru:'Russian', zh:'Chinese',
-          ja:'Japanese', ko:'Korean', ar:'Arabic', pt:'Portuguese',
-          nl:'Dutch', tr:'Turkish', uk:'Ukrainian', he:'Hebrew', hi:'Hindi',
-          th:'Thai', el:'Greek', sk:'Slovak', hu:'Hungarian', ro:'Romanian',
-          sv:'Swedish', no:'Norwegian', da:'Danish', fi:'Finnish',
-        })[tgtLang] || tgtLang;
-        try {
-          const resp = await this.env.AI.run('@cf/meta/llama-3.2-1b-instruct', {
-            messages: [
-              { role: 'system', content: 'You translate text. Respond with only the translation. No explanation, no labels, no quotes around the output.' },
-              { role: 'user', content: 'Translate this to ' + langName + ':\n\n' + txt.slice(0, 1000) },
-            ],
-            max_tokens: 400,
-            temperature: 0.1,
-          });
-          const out = (resp && typeof resp.response === 'string' ? resp.response : '').replace(/[<>]/g, '').trim();
-          return out;
-        } catch (e) {
-          console.error('LLM translate failed:', e && e.message);
-          return '';
-        }
-      };
-      let translated = '';
-      if (source && source !== 'auto') {
-        // Client supplied a confident guess (guessLatinLang result or a
-        // non-Latin script default). Trust it; one m2m100 call.
-        translated = await tryTranslate(source);
-      } else {
-        // Source unknown. LLM identifies, then m2m100 translates. Total:
-        // 2 AI calls per first-time translation, both cached after.
-        const detected = await detectLanguage(text);
-        if (detected && detected !== targetLang) {
-          translated = await tryTranslate(detected);
-        }
-        // Fallback chain if LLM detection failed entirely OR m2m100
-        // rejected the detected source.
-        if (!translated) {
-          const candidates = ['cs', 'pl', 'de'];
-          const inputLower = text.toLowerCase();
-          for (const candidate of candidates) {
-            if (candidate === targetLang) continue;
-            const result = await tryTranslate(candidate);
-            if (result && result.toLowerCase() !== inputLower) {
-              translated = result;
-              break;
-            }
-          }
-        }
-      }
-      // Final fallback: m2m100 produced nothing useful through any path.
-      // Most often this is diacritic-less text (Czech/Polish/Slovak typed
-      // without accents) that m2m100 can't handle. Ask the LLM to translate
-      // directly; output quality is lower but reliably non-empty.
-      if (!translated) {
-        translated = await translateViaLLM(text, targetLang);
-        // Guard against the LLM echoing the input verbatim or returning
-        // a refusal like "I cannot translate this." A simple identity
-        // check catches echoes; refusals are accepted as-is since they
-        // at least give the user something.
-        if (translated && translated.toLowerCase() === text.toLowerCase()) {
-          translated = '';
-        }
-      }
-      if (!translated) {
-        return new Response('Translation returned empty result',
-          { status: 502, headers: { 'Content-Type': 'text/plain', ...corsHdrs } });
-      }
-      // Cache fire-and-forget; missing cache write isn't user-visible.
-      if (cacheKey) {
-        this.state.storage.put(cacheKey, translated).catch(() => {});
-      }
-      return new Response(JSON.stringify({ translated, cached: false }),
-        { status: 200, headers: { 'Content-Type': 'application/json', ...corsHdrs } });
     }
 
     if (url.pathname === '/status-wide.svg') {
@@ -2319,10 +2316,8 @@ export class EspRelay {
 const NO_CACHE_PREFIX = ['/logs', '/admin', '/_ws', '/_stream',
   '/guestbook/entries', '/guestbook/submit', '/guestbook/pending', '/guestbook/moderate',
   '/guestbook/replies', '/guestbook/locate'];
-// Exact matches: prefix would over-match (e.g. /guestbook/translate).
-const NO_CACHE_EXACT = new Set(['/console.json',
-  '/adsb.json',
-  '/guestbook/translate']);
+// Exact matches: a prefix rule would over-match sibling paths.
+const NO_CACHE_EXACT = new Set(['/console.json', '/adsb.json']);
 
 // Static page shells that the chip serves with a short Cache-Control. Bumping
 // these to longer CF edge TTL collapses 90%+ of relay-bound traffic, which is
