@@ -8261,6 +8261,45 @@ static void ccs811Diagnostic() {
     if (err != lastErr) { lastErr = err; if (err) logError("sensor", buf); }
 }
 
+// Records the CCS811 fault state on a slow cadence. MAX_RESISTANCE is latched
+// until reset, so the only way to tell whether the sensor is genuinely faulty or
+// merely never given a long enough run is to sample it over hours. Reports only
+// when the code changes, plus a heartbeat every 30 minutes, so the log shows
+// progress without flooding.
+static void sampleCcs811() {
+    static uint8_t lastErr = 0xFF;
+    static unsigned long lastBeat = 0;
+    unsigned long now = millis();
+
+    uint8_t status = 0, err = 0;
+    Wire.beginTransmission(CCS811_ADDRESS);
+    Wire.write(0x00);
+    if (Wire.endTransmission(false) == 0 &&
+        Wire.requestFrom((uint8_t)CCS811_ADDRESS, (uint8_t)1) >= 1)
+        status = Wire.read();
+    Wire.beginTransmission(CCS811_ADDRESS);
+    Wire.write(0xE0);
+    if (Wire.endTransmission(false) == 0 &&
+        Wire.requestFrom((uint8_t)CCS811_ADDRESS, (uint8_t)1) >= 1)
+        err = Wire.read();
+
+    char buf[96];
+    if (err != lastErr) {
+        lastErr = err;
+        snprintf(buf, sizeof(buf), "ccs811 sample: error_id=0x%02X status=0x%02X%s",
+                 err, status, err == 0 ? " (healthy)" : "");
+        Serial.println(buf);
+        logError("sensor", buf);
+        return;
+    }
+    if (now - lastBeat >= 30UL * 60UL * 1000UL) {
+        lastBeat = now;
+        snprintf(buf, sizeof(buf), "ccs811 soak: error_id=0x%02X status=0x%02X, %lu min in this state",
+                 err, status, 30UL);
+        Serial.println(buf);
+    }
+}
+
 // Recovery for a CCS811-only stall: SW-reset and re-init the chip on a
 // cooldown. begin() runs the SW_RESET sequence, restarts the app, and sets
 // 1-second drive mode, which clears the latched ERROR flag. On success the
@@ -8634,10 +8673,22 @@ void loop() {
                 cachedFsUsedMB = (float)SD.usedBytes() / (1024.0f * 1024.0f);
             }
             Serial.println("Logged at: " + getTimestamp());
+
+            // Refresh the pending count. It was computed once in setup() and
+            // never again, so any submission made after boot left the counter
+            // stale: the LED never switched to solid-on and the admin pending
+            // list stayed at its boot value.
+            countPendingGuestbook();
+
+            // CCS811 sampler. The error bits are latched until reset, so this
+            // records whether a long uninterrupted soak actually clears them,
+            // rather than guessing from a single boot's log.
+            sampleCcs811();
         }
     }
 
-    // Alerts-only notification LED (GPIO2 onboard blue LED, active-low). Priority:
+    
+// Alerts-only notification LED (GPIO2 onboard blue LED, active-low). Priority:
     //   solid ON   = guestbook entries pending moderation
     //   1Hz blink  = a sensor is degraded/failed
     //   off        = all quiet
