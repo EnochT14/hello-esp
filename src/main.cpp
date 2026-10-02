@@ -352,6 +352,14 @@ volatile float    cached_pressure_hpa = 1013.25f;
 volatile float    cached_altitude_ft  = 0.0f;
 volatile unsigned long lastBmeGoodAt = 0;
 volatile unsigned long lastCcsGoodAt = 0;
+
+// CCS811: how often environmental compensation is pushed, and the last error
+// report. The compensation feed runs on its own timer because DATA_READY never
+// asserts while the chip is in MAX_RESISTANCE.
+constexpr unsigned long CCS_ENV_INTERVAL_MS = 30000UL;
+volatile unsigned long lastCcsEnvAt = 0;
+volatile unsigned long lastCcsErrAt = 0;
+volatile uint8_t lastCcsErrId = 0;
 #define SENSOR_STALE_MS  120000UL
 
 // Optional Shelly power-monitoring data. Polled from a Gen 2+ smart plug
@@ -8263,7 +8271,11 @@ static void tryCcs811Recovery() {
     static unsigned long lastTryAt = 0;
     static bool lastRecoveryOk = true; // stale-transition log already covers first failure
     unsigned long now = millis();
-    if (lastTryAt && now - lastTryAt < 120000UL) return;
+    // MAX_RESISTANCE clears only once the chip runs long enough to
+    // re-baseline, and each SW-reset restarts that. The old 120s retry
+    // made recovery impossible; give it a long uninterrupted run.
+    static constexpr unsigned long kCcsRetryMs = 30UL * 60UL * 1000UL;
+    if (lastTryAt && now - lastTryAt < kCcsRetryMs) return;
     lastTryAt = now;
 
     Serial.println("[sensor] CCS811 stale, SW-resetting chip");
@@ -8567,9 +8579,21 @@ void loop() {
 
     renderDisplayPage();
 
-    if (!ccsHealth.retired && ccs.available()) {
+    // Feed environmental compensation on its own cadence, independent of
+    // DATA_READY. It used to sit inside `if (ccs.available())`, which is a
+    // deadlock: available() needs DATA_READY, and the chip cannot complete a
+    // measurement - or escape MAX_RESISTANCE - without the temperature and
+    // humidity correction. So the compensation it needed was only ever sent
+    // when it had already recovered on its own.
+    if (!ccsHealth.retired && millis() - lastCcsEnvAt >= CCS_ENV_INTERVAL_MS) {
+        lastCcsEnvAt = millis();
         ccs.setEnvironmentalData(safeBmeHumidity(), safeBmeTemp());
-        if (!ccs.readData()) {
+    }
+
+    if (!ccsHealth.retired && ccs.available()) {
+        // This library returns 0 on success and the ERROR_ID byte on failure.
+        const uint8_t ccsErr = ccs.readData();
+        if (!ccsErr) {
             uint16_t co2 = ccs.geteCO2();
             uint16_t voc = ccs.getTVOC();
             // CCS811 algorithm output: eCO2 400-32768 ppm, TVOC 0-32768 ppb.
@@ -8581,9 +8605,20 @@ void loop() {
             bool gotAny = false;
             if (co2 <= 32768) { cached_co2 = co2; gotAny = true; }
             if (voc <= 32768) { cached_voc = voc; gotAny = true; }
-            if (gotAny) lastCcsGoodAt = millis();
+            if (gotAny) {
+                lastCcsGoodAt = millis();
+                lastCcsErrAt = 0;
+            }
         } else {
-            Serial.println("CCS811 read error");
+            // MAX_RESISTANCE and friends are latched until reset, so this
+            // fires on every pass. Log it once a minute instead of hundreds
+            // of times a second - the volume was drowning the serial link.
+            lastCcsErrId = ccsErr;
+            if (!lastCcsErrAt || millis() - lastCcsErrAt >= 60000UL) {
+                lastCcsErrAt = millis();
+                Serial.printf("[sensor] CCS811 read error 0x%02X\n",
+                              (unsigned)lastCcsErrId);
+            }
         }
     }
 
