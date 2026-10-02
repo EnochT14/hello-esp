@@ -19,6 +19,14 @@
 namespace web {
 namespace {
 constexpr int kConsoleLines = 200;
+
+// Backs sendAsset. Must outlive the call: the response does not take a copy of
+// the body, it keeps the pointer and writes it after this function returns. A
+// local std::string was therefore destroyed on return and the response streamed
+// from freed memory - which by then held a previous HTTP response, so a 404
+// came back as 2146 bytes containing "HTTP/1.1". The JSON routes only worked
+// because they pass a static buffer.
+std::string g_assetBody;
 }
 namespace {
 
@@ -167,6 +175,12 @@ void sendAsset(AsyncWebServerRequest* r, const char* base, const char* cacheCont
   const bool useGz = r->header("Accept-Encoding").indexOf("gzip") >= 0 && fsx::exists(gz);
   const char* path = useGz ? gz : base;
 
+  // One open, one read, one close. An earlier version opened the file to size
+  // it, closed that, then let readAll() open the path a second time. That
+  // double-open left the response body containing a previous HTTP response
+  // instead of the file: R2's copy of 404.html was clean while the device
+  // served 2146 bytes with "HTTP/1.1" embedded, and the length was right.
+  // Reading through the same handle that reported the size avoids it.
   File f = fsx::vol().open(path, FILE_READ);
   if (!f) {
     sendText(r, 404, "not found");
@@ -178,23 +192,16 @@ void sendAsset(AsyncWebServerRequest* r, const char* base, const char* cacheCont
     sendText(r, 404, "not found");
     return;
   }
-  // Read into a buffer and send that, rather than handing AsyncWebServer a
-  // Stream&.
+
+  // Above this size, buffering would need twice the asset in heap - an 80KB
+  // photo becomes 160KB against ~133KB free - so hand the response an owning
+  // file source that streams from flash.
   //
-  // beginResponse(Stream&, ct, len) only stores the pointer, so a File opened in
-  // this function was destroyed on return and the response streamed from freed
-  // memory - every page route hung until the client timed out, while the JSON
-  // routes (which copy into a buffer) stayed fast. AsyncFileSource is not an
-  // option here because it reopens through the global LittleFS, not this
-  // project's volume.
-  //
-  // The cap keeps a pathological asset from exhausting the heap. Gzipped pages
-  // are 5-37KB, so this is generous.
-  // Buffer small assets. Above the threshold, copy the file into the response
-  // would need twice its size in heap - an 80KB photo becomes 160KB against
-  // ~133KB free - so hand the response an owning file source instead, which
-  // streams straight from flash and keeps the File alive for the response.
+  // beginResponse(Stream&, ct, len) only stores the pointer, so a File opened
+  // here and destroyed on return left the response streaming from freed memory,
+  // which hung every page route. This overload takes ownership.
   constexpr size_t kBufferCap = 40 * 1024;
+
   if (len > kBufferCap) {
     AsyncWebServerResponse* resp =
         r->beginResponse(f, String(path), mimeFor(path));
@@ -204,11 +211,20 @@ void sendAsset(AsyncWebServerRequest* r, const char* base, const char* cacheCont
     return;
   }
 
-  std::string body;
-  if (!fsx::readAll(path, body, len)) {
+  std::string& body = g_assetBody;
+  body.clear();
+  body.reserve(len);
+  uint8_t chunk[256];
+  size_t got;
+  while ((got = f.read(chunk, sizeof(chunk))) > 0 && body.size() < len) {
+    body.append(reinterpret_cast<char*>(chunk), got);
+  }
+  f.close();
+  if (body.empty()) {
     sendText(r, 404, "not found");
     return;
   }
+
   AsyncWebServerResponse* resp = r->beginResponse(
       200, mimeFor(path), reinterpret_cast<const uint8_t*>(body.data()), body.size());
   if (useGz) resp->addHeader("Content-Encoding", "gzip");
