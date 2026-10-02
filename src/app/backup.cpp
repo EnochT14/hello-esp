@@ -12,7 +12,11 @@ namespace {
 
 constexpr int  kHourLocal = 4;
 constexpr uint32_t kIdleGapMs = 60000;
-constexpr uint16_t kFileGapMs = 60;
+constexpr uint16_t kFileGapMs = 25;
+
+// Counts frames the socket refused, reported once at the end of a run so a
+// failing backup says why instead of just reporting a byte total.
+unsigned g_writeFailures = 0;
 
 bool     g_running = false;
 bool     g_requested = false;
@@ -27,6 +31,11 @@ bool excludedPath(const char* abs, const char* base) {
   if (strcmp(abs, "/config.txt") == 0) return true;      // secrets stay local
   if (strcmp(base, "state.bin") == 0) return true;       // runtime blob, rebuilt
   if (strcmp(base, "sensor_health.bin") == 0) return true;
+  // /fw is the staging area for firmware uploads. It is normally empty, but a
+  // leftover image from an aborted update made the walk try to read paths that
+  // do not exist, and every one showed up as an "unreadable" row in the
+  // manifest - which then masked the real data behind noise.
+  if (strncmp(abs, "/fw/", 4) == 0) return true;
   const size_t n = strlen(base);
   if (n > 4 && (strcmp(base + n - 4, ".tmp") == 0 ||
                 strcmp(base + n - 4, ".bak") == 0)) {
@@ -104,10 +113,21 @@ void sendFile(const char* abs, const char* base, size_t size, uint32_t seq) {
     const size_t n = f.read(block, sizeof(block));
     if (n == 0) break;
     encodeB64(block, n, b64, sizeof(b64));
-    relay::pushBackupFileChunk(seq, b64);
+    if (!relay::pushBackupFileChunk(seq, b64)) {
+      g_writeFailures++;
+      // The socket refused the frame. Emitting a file_end after a lost chunk
+      // would tell the Worker to store a truncated file, so report it skipped
+      // and let the snapshot record that instead.
+      f.close();
+      relay::pushBackupFileSkipped(seq, name, size, "write_failed");
+      return;
+    }
   }
   f.close();
-  relay::pushBackupFileEnd(seq, name);
+  if (!relay::pushBackupFileEnd(seq, name)) {
+    relay::pushBackupFileSkipped(seq, name, size, "write_failed");
+    return;
+  }
 }
 
 void runOnce() {
@@ -157,8 +177,14 @@ void runOnce() {
   if (!g_lastOk) setError("socket dropped mid-transfer");
   g_lastRunMs = millis();
   snprintf(g_lastDate, sizeof(g_lastDate), "%s", date);
-  Serial.printf("[backup] %s (%u bytes)\n", g_lastOk ? "committed" : "incomplete",
-                (unsigned)total);
+  if (g_writeFailures) {
+    g_lastOk = false;
+    setError("relay write failed");
+  }
+  Serial.printf("[backup] %s (%u bytes, %u write failures)\n",
+                g_lastOk ? "committed" : "incomplete", (unsigned)total,
+                (unsigned)g_writeFailures);
+  g_writeFailures = 0;
 }
 
 }  // namespace

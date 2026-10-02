@@ -953,6 +953,12 @@ export class EspRelay {
     }
 
     const s = this.backupSessions.get(seq);
+    // Sampled: a full backup emits thousands of chunk events and the tail
+    // budget is finite. Session-lifecycle events are always logged.
+    EspRelay._evCount = (EspRelay._evCount || 0) + 1;
+    if (msg.event !== 'backup_file_chunk' || EspRelay._evCount % 200 === 0) {
+      console.log(`backup event ${msg.event} seq=${seq} known=${!!s} n=${EspRelay._evCount} bytes=${s ? s.bytes : 0} len=${(msg.data || '').length}`);
+    }
     if (!s) {
       // Previously a silent return, which is how a lost bundle looked like a
       // success. Make it visible.
@@ -988,7 +994,7 @@ export class EspRelay {
     }
 
     if (msg.event === 'backup_file_end') {
-      if (!s.currentFile) return;
+      if (!s.currentFile) { console.log(`backup_file_end with no current file seq=${seq}`); return; }
       const name = String(msg.name || s.currentFile.name || 'unknown');
       const declared = s.currentFile.size;
       const b64 = s.currentFile.chunks.join('');
@@ -1004,6 +1010,7 @@ export class EspRelay {
 
       const row = await this._storeBackupFile(s, name, declared, b64);
       s.entries.push(row);
+      if (row.skipped) console.log(`backup file skipped: ${name} (${row.skipped})`);
       if (s.bytes > EspRelay.MAX_TOTAL_BYTES) {
         s.aborted = true;
         this.backupSessions.delete(seq);
@@ -1024,12 +1031,14 @@ export class EspRelay {
 
     if (msg.event === 'backup_end') {
       const originalSize = Math.max(0, parseInt(msg.size, 10) || 0);
+      console.log(`backup_end seq=${seq} files=${s.entries.length} bytes=${s.bytes} envBACKUP=${!!this.env.BACKUP}`);
       this.backupSessions.delete(seq);
       if (!this.env.BACKUP) {
         await this.emailBackupBundle(s.meta, s.emailFiles, originalSize);
         return;
       }
-      await this.commitBackupBundle(s, originalSize);
+      const ok = await this.commitBackupBundle(s, originalSize);
+      console.log(`commitBackupBundle -> ${ok}`);
     }
   }
 
@@ -1140,6 +1149,7 @@ export class EspRelay {
 
     // Fire-and-forget rotation. Its failure is logged but doesn't invalidate
     // the committed backup.
+    console.log(`backup committed date=${date} files=${entries.length} bytes=${session.bytes}`);
     this._rotateSnapshots().catch(e => console.error('rotation failed:', e && e.message));
     return true;
   }
@@ -2086,9 +2096,15 @@ export class EspRelay {
               // every runtime version.
               const pending = this.handleEvent(msg)
                 .catch((e) => console.error('handleEvent error:', e && e.message));
-              const ctx = this.state || this.ctx;
+              const ctx = this.state;
               if (ctx && typeof ctx.waitUntil === 'function') {
                 ctx.waitUntil(pending);
+                if (!EspRelay._waitUntilLogged) {
+                  EspRelay._waitUntilLogged = true;
+                  console.log('DurableObjectState.waitUntil is available');
+                }
+              } else {
+                console.warn('no waitUntil on DurableObjectState; backup writes may be cancelled');
               }
               return;
             }
