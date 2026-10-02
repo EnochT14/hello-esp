@@ -6,6 +6,15 @@ data/config.txt
 data/logs/
 data/stats/
 data/records/
+# Device runtime state - staged from the ESP32 filesystem, never source.
+data/countries.csv
+data/daily.txt
+data/guestbook.csv
+data/guestbook.schema
+data/lastseen.txt
+data/power_events.csv
+data/visitors.txt
+data/sensor_health.bin
 *.bak
 *.tmp
 .wrangler
